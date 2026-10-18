@@ -1,0 +1,26 @@
+# Model weights and the llama.cpp build are downloaded, not committed (tens of GB)
+models/
+llama/
+dl/
+
+# Runtime / per-user
+sessions/
+workspace/
+attachments/
+Local_Coder.ini
+**/.lcoder_shots/
+**/.lcoder_web/
+**/.venv/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.mypy_cache/
+
+# OS / editor
+Thumbs.db
+desktop.ini
+.vs/
+.idea/
+*.log

@@ -1,0 +1,9 @@
+# Local Coder depends on VertexUI (the UI toolkit) and Pillow (image handling).
+# VertexUI pulls in imgui-bundle and numpy. Install with:
+#   pip install -r requirements.txt
+#
+# The agent itself needs nothing beyond the standard library; extra packages
+# (capstone, pefile, ...) are installed by the agent per project, on demand.
+
+vertexui @ git+https://github.com/D4ead3ye/vertexui
+Pillow>=10.0
