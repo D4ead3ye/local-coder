@@ -12,6 +12,7 @@ frame spent on decoration is VRAM and time taken from generation.
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import time
 from pathlib import Path
@@ -19,10 +20,12 @@ from pathlib import Path
 from imgui_bundle import hello_imgui, imgui, ImVec2
 
 import vertexui as vui
-from vertexui import theme, widgets, cards, icons, logview, fonts, settings, anim
+from vertexui import (theme, widgets, cards, icons, logview, fonts, settings, anim,
+                      effects as fx_mod, backdrop as bg_mod)
 
 from . import server as srv
 from . import prompt
+from . import rp as rp_mod
 from .agent import Agent, Item, MODES, MODE_LABELS
 
 TABS = ["Agente", "Servidor", "Ajustes"]
@@ -59,6 +62,13 @@ def fmt_secs(s: float) -> str:
     return f"{s:.1f}s" if s < 60 else f"{int(s // 60)}m{int(s % 60):02d}s"
 
 
+def _scrim_fn(dl, x, y, w, h, t, amount, rounding=0.0):
+    if amount <= 0.004:
+        return
+    dl.add_rect_filled(ImVec2(x, y), ImVec2(x + w, y + h),
+                       imgui.get_color_u32(theme.with_alpha(t.bg, min(1.0, amount))), rounding)
+
+
 class App:
     def __init__(self, st: settings.Settings):
         self.st = st
@@ -75,7 +85,6 @@ class App:
         self.stick = True                   # transcript follows the bottom
         self._last_items = 0
         self.attach: list[str] = []         # images going with the next prompt
-
         self.server = srv.Server(int(ex.get("port", 8089)))
         self.log = logview.LogView(speed="calm", timestamps=True, tags=True)
         self.st.apply(self.log)
@@ -86,6 +95,38 @@ class App:
         self.agent.on_event = self._agent_event
         self._apply_accent()
 
+        # RP side (hidden): persona chat, no tools
+        self.rp_mode = False
+        self.rp_dir = ex.get("rp_dir", str(rp_mod.CARDS_DIR))
+        self.rp_user = ex.get("rp_user", "Você")
+        self.rp_user_desc = ex.get("rp_user_desc", "")      # your own character's lore
+        self.rp_personas: list = ex.get("rp_personas", [])  # saved {"name", "desc"}
+        self._rp_pidx = 0
+        self.rp = rp_mod.RPChat(self.server.base, self.rp_user)
+        self.rp.user_desc = self.rp_user_desc
+        self.rp.on_update = lambda: None
+        self.rp_cards: list = []
+        self.rp_prompt = ""
+        self.rp_focus = False
+        self._rp_hint = 0.0                  # the corner dot brightens on hover
+        self._rp_edit = -1                   # turn index being edited, or -1
+        self._rp_edit_buf = ""
+        self._rp_ctrl_hot = -1               # turn whose controls are shown
+
+        # Style layer: a GPU shader backdrop and drifting particles, like the
+        # OctoView/Bedside apps. First run seeds a look worth showing.
+        if not ex.get("styled"):
+            st.backdrop, st.backdrop_intensity, st.backdrop_speed = "nebula", 0.6, 0.5
+            st.effect, st.effect_over = "embers", 0.3
+            st.card_style = "raised"
+            ex["styled"] = True
+        self.fx = fx_mod.Effects(st.effect)
+        self.bg = bg_mod.Backdrop(st.backdrop)
+        self.st.apply(self.log, backdrop=self.bg, effects=self.fx)
+        self._screen_was = ("rp", self.tab)
+        self._fade = 0.0
+        self._tex: dict = {}                 # avatar path -> (texid, w, h) or None
+
         if not self.server.adopt_existing() and srv.model(self.model_key).present:
             self.server.start(self.model_key, self.ctx)
 
@@ -93,7 +134,9 @@ class App:
 
     def save(self):
         self.st.extras.update(model=self.model_key, ctx=self.ctx, mode=self.mode,
-                              workspace=self.ws, profile=self.profile)
+                              workspace=self.ws, profile=self.profile,
+                              rp_dir=self.rp_dir, rp_user=self.rp_user,
+                              rp_user_desc=self.rp_user_desc, rp_personas=self.rp_personas)
         try:
             self.st.save()
         except Exception:
@@ -117,6 +160,18 @@ class App:
     def frame(self):
         self.pump_log()
         t = theme.current()
+        io = imgui.get_io()
+        now = imgui.get_time()
+        w, h = io.display_size.x, io.display_size.y
+        dlw = imgui.get_window_draw_list()
+
+        # 1) GPU shader backdrop first, painting over the window's own fill.
+        self.bg.draw()
+        # 2) particles behind the content.
+        moving = self.fx.kind != "none" and self.fx.step(now, io.delta_time)
+        if moving:
+            self.fx.paint(dlw, 0, 0, w, h, now, 1.0)
+
         imgui.push_style_var(imgui.StyleVar_.window_padding, ImVec2(0, 0))
         self._topbar(t)
         imgui.pop_style_var()
@@ -124,15 +179,35 @@ class App:
         pad = 16.0
         imgui.dummy(ImVec2(0, 2))
         imgui.indent(pad)
-        self.tab = widgets.tabs("nav", TABS, self.tab)
-        imgui.dummy(ImVec2(0, 6))
-        [self._agent_tab, self._server_tab, self._settings_tab][self.tab](t, pad)
+        # a wash behind bare text so the moving backdrop never eats legibility
+        if (self.rp_mode or self.tab in (1, 2)):
+            _scrim_fn(dlw, 0, 56, w, h - 56, t, 0.5 if self.tab in (1, 2) else 0.32)
+        if self.rp_mode:
+            self._rp_frame(t, pad)
+        else:
+            self.tab = widgets.tabs("nav", TABS, self.tab)
+            imgui.dummy(ImVec2(0, 6))
+            [self._agent_tab, self._server_tab, self._settings_tab][self.tab](t, pad)
         imgui.unindent(pad)
+
+        # 3) particles again over the top, drifting across the panels.
+        if moving and self.st.effect_over > 0.004:
+            self.fx.paint(dlw, 0, 0, w, h, now, self.st.effect_over)
+        # 4) a short fade over any screen change reads as navigation.
+        screen = ("rp", self.rp.card.name if self.rp.card else "") if self.rp_mode else ("code", self.tab)
+        if screen != self._screen_was:
+            self._screen_was = screen
+            self._fade = 1.0
+        if self._fade > 0.004:
+            self._fade = max(0.0, self._fade - io.delta_time * 4.5)
+            dlw.add_rect_filled(ImVec2(0, 0), ImVec2(w, h),
+                                C(theme.with_alpha(t.bg, self._fade * 0.6)))
+            anim.mark_busy()
 
         vui.end_frame()
         # tokens arrive from another thread with no input event to wake the
         # frame loop; idling would redraw the stream at the idle rate
-        if self.agent.busy or self.server.state == "starting":
+        if self.rp.busy or self.agent.busy or self.server.state == "starting":
             try:
                 hello_imgui.get_runner_params().fps_idling.enable_idling = False
             except Exception:
@@ -232,11 +307,17 @@ class App:
         dl.add_rect_filled(o, ImVec2(o.x + w, o.y + h), C(theme.with_alpha(t.panel, 0.96)))
         dl.add_line(ImVec2(o.x, o.y + h), ImVec2(o.x + w, o.y + h),
                     C(theme.with_alpha(t.accent, 0.5)), 1.5)
-        self._profile_glyph(dl, prof["icon"], o.x + 27, o.y + h / 2, 11, C(t.accent_bright))
-        name = prof["label"].upper()
-        widgets.caps(dl, o.x + 50, o.y + 13, name, C(t.text), 2.4)
-        with fonts.use("label"):
-            widgets.caps(dl, o.x + 50, o.y + 33, prof["tag"], C(t.text_dim), 2.6)
+        if self.rp_mode:
+            cname = (self.rp.card.name if self.rp.card else "ROLEPLAY").upper()
+            dl.add_circle_filled(ImVec2(o.x + 27, o.y + h / 2), 6, C(t.accent_bright))
+            widgets.caps(dl, o.x + 50, o.y + 13, cname[:22], C(t.text), 2.0)
+            with fonts.use("label"):
+                widgets.caps(dl, o.x + 50, o.y + 33, "ROLEPLAY", C(t.text_dim), 2.6)
+        else:
+            self._profile_glyph(dl, prof["icon"], o.x + 27, o.y + h / 2, 11, C(t.accent_bright))
+            widgets.caps(dl, o.x + 50, o.y + 13, prof["label"].upper(), C(t.text), 2.4)
+            with fonts.use("label"):
+                widgets.caps(dl, o.x + 50, o.y + 33, prof["tag"], C(t.text_dim), 2.6)
 
         s = self.server
         ready = s.ready
@@ -263,7 +344,36 @@ class App:
 
         imgui.set_cursor_screen_pos(ImVec2(o.x + w - 220, o.y + 15))
         widgets.status_pill(word, word, on=on, key="srv")
+
+        # Semi-hidden entrance to the RP side: a small unlabeled speech bubble
+        # in the far corner. Dim but visible, it brightens and shows a tooltip
+        # on hover - discreet, but findable now.
+        bx, by, bw2, bh2 = o.x + w - 44, o.y + 13, 28.0, 26.0
+        imgui.set_cursor_screen_pos(ImVec2(bx, by))
+        imgui.invisible_button("##rpbubble", ImVec2(bw2, bh2))
+        hov = imgui.is_item_hovered()
+        self._rp_hint = anim.to("rpbubble", 1.0 if hov else 0.0, 12.0)
+        if self._rp_hint > 0.01:
+            dl.add_rect_filled(ImVec2(bx, by), ImVec2(bx + bw2, by + bh2),
+                               C(theme.with_alpha(t.accent, 0.16 * self._rp_hint)), 6.0)
+        col = theme.lerp(theme.with_alpha(t.text_mute, 0.7), t.accent_bright, self._rp_hint)
+        self._bubble_glyph(dl, bx + bw2 / 2, by + bh2 / 2 - 1, 8.0, C(col))
+        if hov:
+            imgui.set_tooltip("Roleplay")
+        if imgui.is_item_clicked():
+            self.enter_rp()
+
         imgui.set_cursor_screen_pos(ImVec2(o.x, o.y + h))
+
+    def _bubble_glyph(self, dl, cx, cy, r, col):
+        """A little rounded speech bubble with a tail and two dots."""
+        x0, y0, x1, y1 = cx - r, cy - r * 0.78, cx + r, cy + r * 0.5
+        dl.add_rect_filled(ImVec2(x0, y0), ImVec2(x1, y1), col, r * 0.5)
+        dl.add_triangle_filled(ImVec2(cx - r * 0.45, y1 - 1), ImVec2(cx - r * 0.05, y1 - 1),
+                               ImVec2(cx - r * 0.75, y1 + r * 0.55), col)
+        bg = theme.current().panel
+        for dx in (-r * 0.4, 0.0, r * 0.4):
+            dl.add_circle_filled(ImVec2(cx + dx, cy - r * 0.14), r * 0.12, C(bg))
 
     # -- agent tab -------------------------------------------------------
 
@@ -669,6 +779,439 @@ class App:
 
     # -- other tabs ------------------------------------------------------
 
+    # -- RP (hidden) -----------------------------------------------------
+
+    def enter_rp(self):
+        self.rp_mode = True
+        self.rp.base = self.server.base
+        self.rp_cards = rp_mod.list_cards(self.rp_dir)
+        self.rp_focus = True
+        self.save()
+        vui.sound.play("click")
+
+    def exit_rp(self):
+        self.rp.stop()
+        self.rp_mode = False
+        vui.sound.play("click")
+
+    def _rp_frame(self, t, pad):
+        avail = imgui.get_content_region_avail()
+        h = avail.y - 12
+        # left: characters
+        imgui.begin_child("rpside", ImVec2(SIDE_W, h))
+        try:
+            self._rp_side(t)
+        finally:
+            imgui.end_child()
+        imgui.same_line(0, 14)
+        imgui.begin_group()
+        main_w = avail.x - SIDE_W - 14 - pad
+        input_h = 84.0
+        imgui.begin_child("rpchat", ImVec2(main_w, h - input_h - 10))
+        try:
+            self._rp_chat(t, main_w)
+        finally:
+            imgui.end_child()
+        self._rp_input(t, main_w, input_h)
+        imgui.end_group()
+
+    def _rp_side(self, t):
+        with cards.card("roleplay", icon=None, right="sair", right_col=t.text_dim) as c:
+            if widgets.button("<  Voltar ao código", c.width, key="rp_back"):
+                self.exit_rp()
+            note("Chat de personagem, sem ferramentas. Conteúdo gerado pelo modelo "
+                 "local (use o abliterated). Ficção adulta.")
+
+        imgui.dummy(ImVec2(0, 4))
+        with cards.card("personagens", icon="folder") as c:
+            imgui.set_next_item_width(c.width)
+            changed, val = imgui.input_text("##rpdir", self.rp_dir)
+            if changed:
+                self.rp_dir = val
+            if imgui.is_item_deactivated_after_edit():
+                self.rp_cards = rp_mod.list_cards(self.rp_dir)
+                self.save()
+            bw = (c.width - 10) / 2
+            if widgets.button("Pasta", bw, key="rp_pick"):
+                self._rp_pick_folder()
+            imgui.same_line(0, 10)
+            if widgets.button("Recarregar", bw, key="rp_reload"):
+                self.rp_cards = rp_mod.list_cards(self.rp_dir)
+            imgui.dummy(ImVec2(0, 4))
+            if not self.rp_cards:
+                note("Nenhum card .json/.png aqui. Aponte para a pasta dos seus personagens.")
+            for f in self.rp_cards[:200]:
+                active = self.rp.card is not None and self.rp.card.path == str(f)
+                if widgets.button(f.stem[:26], c.width, primary=active,
+                                  key="rpc:" + str(f), enabled=not self.rp.busy):
+                    self._rp_load(f)
+
+        imgui.dummy(ImVec2(0, 4))
+        imgui.dummy(ImVec2(0, 4))
+        with cards.card("cena", icon=None) as c:
+            with fonts.use("label"):
+                imgui.text_colored(t.text_mute, "NOTA DE AUTOR (DIREÇÃO, SEM VIRAR FALA)")
+            imgui.push_style_color(imgui.Col_.frame_bg, t.surface)
+            chn, vn = imgui.input_text_multiline("##authnote", self.rp.author_note,
+                                                 ImVec2(c.width, 56),
+                                                 imgui.InputTextFlags_.word_wrap)
+            imgui.pop_style_color()
+            if chn:
+                self.rp.author_note = vn
+            self.rp.temperature = widgets.slider("criatividade", self.rp.temperature,
+                                                 0.3, 1.3, width=c.width - 96, fmt="%.2f",
+                                                 key="rp_temp")
+            tl = {280: "curta", 420: "média", 640: "longa", 900: "muito longa"}
+            opts = [280, 420, 640, 900]
+            ci = min(range(len(opts)), key=lambda i: abs(opts[i] - self.rp.max_tokens))
+            nci = widgets.combo("resposta", [tl[o] for o in opts], ci, width=c.width - 90, key="rp_len")
+            self.rp.max_tokens = opts[nci]
+            note("A nota de autor manda mais que a conversa. Criatividade alta varia "
+                 "mais; baixa fica mais previsível.")
+
+        imgui.dummy(ImVec2(0, 4))
+        with cards.card("lorebook", icon=None) as c:
+            if self.rp.lore and self.rp.lore.entries:
+                n = len(self.rp.lore.entries)
+                imgui.text_colored(t.text_dim, f"{n} entrada(s)" +
+                                   (f" · {self.rp.lore_hits} ativa(s) agora" if self.rp.lore_hits else ""))
+            else:
+                imgui.text_colored(t.text_mute, "nenhuma (o card pode trazer a sua)")
+            if widgets.button("Carregar lorebook (.json)", c.width, key="rp_lore"):
+                self._rp_pick_lore()
+            note("World Info: fatos do mundo injetados quando a conversa cita as "
+                 "palavras-chave. O card v2 já traz o seu, se tiver.")
+
+        imgui.dummy(ImVec2(0, 4))
+        with cards.card("seu personagem", icon=None) as c:
+            # saved personas
+            if self.rp_personas:
+                names = [p.get("name", "?") for p in self.rp_personas]
+                self._rp_pidx = min(self._rp_pidx, len(names) - 1)
+                ni = widgets.combo("", names, self._rp_pidx, width=c.width, key="rp_persona")
+                if ni != self._rp_pidx:
+                    self._rp_pidx = ni
+                    self._rp_apply_persona(self.rp_personas[ni].get("name", "Você"),
+                                           self.rp_personas[ni].get("desc", ""))
+            with fonts.use("label"):
+                imgui.text_colored(t.text_mute, "NOME")
+            imgui.set_next_item_width(c.width)
+            ch, val = imgui.input_text("##rpuser", self.rp_user)
+            if ch:
+                self.rp_user = val or "Você"
+                self.rp.user_name = self.rp_user
+            if imgui.is_item_deactivated_after_edit():
+                self.save()
+            with fonts.use("label"):
+                imgui.text_colored(t.text_mute, "QUEM VOCÊ É (APARÊNCIA, HISTÓRIA, JEITO)")
+            imgui.push_style_color(imgui.Col_.frame_bg, t.surface)
+            chd, vd = imgui.input_text_multiline("##rpdesc", self.rp_user_desc,
+                                                 ImVec2(c.width, 140),
+                                                 imgui.InputTextFlags_.word_wrap)
+            imgui.pop_style_color()
+            if chd:
+                self.rp_user_desc = vd
+                self.rp.user_desc = vd
+            if imgui.is_item_deactivated_after_edit():
+                self.save()
+            bw = (c.width - 10) / 2
+            if widgets.button("Salvar", bw, key="rp_psave", enabled=bool(self.rp_user.strip())):
+                self._rp_save_persona()
+            imgui.same_line(0, 10)
+            if widgets.button("Do card", bw, key="rp_pcard"):
+                self._rp_persona_from_card()
+            if self.rp_personas and widgets.button("Excluir esta", c.width, key="rp_pdel"):
+                self.rp_personas = [p for p in self.rp_personas if p.get("name") != self.rp_user]
+                self._rp_pidx = 0
+                self.save()
+            note("O personagem conhece você por isto e nunca fala ou age por você. "
+                 "Vale na próxima resposta, sem reiniciar.")
+
+        imgui.dummy(ImVec2(0, 4))
+        with cards.card("modelo", icon=None) as c:
+            cur = self.server.model_key or ""
+            is_rp = srv.model(cur).rp if cur else False
+            tone = t.ok if is_rp else t.warn
+            m = srv.model(cur)
+            imgui.text_colored(tone, "modelo: " + (m.label if cur else "-"))
+            rpm = srv.rp_model()
+            if not is_rp and not self.agent.busy:
+                lbl = f"Ligar {rpm.label}" if rpm.present else f"{rpm.label} (baixando)"
+                if widgets.button(lbl, c.width, primary=True, key="rp_switch",
+                                  enabled=rpm.present):
+                    self.model_key = rpm.key
+                    self.ctx = rpm.ctx
+                    self.save()
+                    self.server.start(rpm.key, rpm.ctx)
+                note("O Cydonia é tunado para roleplay; o Qwen escreve mais seco.")
+            if self.rp.card is not None:
+                if widgets.button("Reiniciar conversa", c.width, key="rp_restart",
+                                  enabled=not self.rp.busy):
+                    self.rp.load(self.rp.card)
+
+    def _rp_apply_persona(self, name, desc):
+        self.rp_user = name or "Você"
+        self.rp_user_desc = desc or ""
+        self.rp.user_name = self.rp_user
+        self.rp.user_desc = self.rp_user_desc
+        self.save()
+
+    def _rp_save_persona(self):
+        """Upsert by name, so saving an edited persona replaces the old one."""
+        entry = {"name": self.rp_user.strip(), "desc": self.rp_user_desc}
+        others = [p for p in self.rp_personas if p.get("name") != entry["name"]]
+        self.rp_personas = others + [entry]
+        self._rp_pidx = len(self.rp_personas) - 1
+        self.save()
+        vui.sound.play("ok")
+
+    def _rp_persona_from_card(self):
+        try:
+            from imgui_bundle import portable_file_dialogs as pfd
+            r = pfd.open_file("Seu personagem (card .json/.png)", self.rp_dir,
+                              ["Cards", "*.json *.png"]).result()
+        except Exception:
+            r = []
+        if r:
+            try:
+                name, desc = rp_mod.load_persona(r[0])
+                self._rp_apply_persona(name, desc)
+            except Exception as e:
+                self.rp.turns.append({"role": "assistant", "text": f"[card inválido: {e}]", "think": ""})
+
+    def _rp_pick_lore(self):
+        try:
+            from imgui_bundle import portable_file_dialogs as pfd
+            r = pfd.open_file("Lorebook / World Info", self.rp_dir,
+                              ["JSON", "*.json"]).result()
+        except Exception:
+            r = []
+        if r:
+            try:
+                self.rp.attach_lorebook(rp_mod.load_lorebook(r[0]))
+            except Exception as e:
+                self.rp.turns.append({"role": "assistant", "text": f"[lorebook inválido: {e}]", "think": ""})
+
+    def _rp_pick_folder(self):
+        try:
+            from imgui_bundle import portable_file_dialogs as pfd
+            r = pfd.select_folder("Pasta dos personagens", self.rp_dir).result()
+        except Exception:
+            r = ""
+        if r:
+            self.rp_dir = r
+            self.rp_cards = rp_mod.list_cards(r)
+            self.save()
+
+    def _rp_load(self, path):
+        try:
+            card = rp_mod.load_card(path)
+        except Exception as e:
+            self.rp.turns = [{"role": "assistant", "text": f"[não consegui ler o card: {e}]", "think": ""}]
+            self.rp.card = None
+            return
+        self.rp.user_name = self.rp_user
+        self.rp.load(card)
+        self.rp_focus = True
+
+    def _avatar(self, dl, cx, cy, r, name, col, path=""):
+        """A round avatar: the card image if present, else a monogram disc."""
+        tex = self._avatar_tex(path) if path else None
+        if tex:
+            tid, iw, ih = tex
+            # square-crop centred, drawn into a circle via a clip-ish ring
+            dl.add_image_rounded(imgui.ImTextureRef(int(tid)), ImVec2(cx - r, cy - r),
+                                 ImVec2(cx + r, cy + r), ImVec2(0, 0), ImVec2(1, 1),
+                                 0xFFFFFFFF, r)
+            dl.add_circle(ImVec2(cx, cy), r, C(theme.with_alpha(col, 0.9)), 32, 2.0)
+        else:
+            dl.add_circle_filled(ImVec2(cx, cy), r, C(theme.with_alpha(col, 0.22)))
+            dl.add_circle(ImVec2(cx, cy), r, C(theme.with_alpha(col, 0.8)), 32, 1.8)
+            ch = (name or "?").strip()[:1].upper()
+            with fonts.use("semi"):
+                sz = imgui.calc_text_size(ch)
+                dl.add_text(ImVec2(cx - sz.x / 2, cy - sz.y / 2), C(col), ch)
+
+    def _avatar_tex(self, path):
+        if path in self._tex:
+            return self._tex[path]
+        out = None
+        try:
+            data = Path(path).read_bytes()
+            r = hello_imgui.image_and_size_from_encoded_data(data)
+            # returns (TextureGpu-ish, size) or (texid, w, h) depending on build
+            if isinstance(r, (tuple, list)) and len(r) >= 2:
+                tid = r[0]
+                sz = r[-1]
+                out = (int(tid) if not hasattr(tid, "texture_id") else int(tid.texture_id),
+                       getattr(sz, "x", 0), getattr(sz, "y", 0))
+        except Exception:
+            out = None
+        self._tex[path] = out
+        return out
+
+    def _rp_chat(self, t, w):
+        if self.rp.card is None:
+            imgui.dummy(ImVec2(0, 40))
+            with fonts.use("title"):
+                imgui.text("Escolha um personagem")
+            imgui.text_colored(t.text_dim, "Selecione um card na coluna da esquerda para começar.")
+            return
+        at_bottom = imgui.get_scroll_y() >= imgui.get_scroll_max_y() - 40
+        av = 38.0                       # avatar diameter
+        gap = 12.0
+        inner = w - 28 - av - gap
+        last = len(self.rp.turns) - 1
+        for n, turn in enumerate(self.rp.turns):
+            imgui.push_id(n)
+            try:
+                self._rp_bubble(t, n, turn, inner, av, gap, n == last)
+            finally:
+                imgui.pop_id()
+            imgui.dummy(ImVec2(0, 6))
+        if self.rp.busy and (not self.rp.turns or self.rp.turns[-1]["role"] == "user"):
+            imgui.text_colored(t.text_mute, f"{self.rp.card.name} está digitando" + "." * (int(time.time() * 2) % 4))
+        imgui.dummy(ImVec2(0, 8))
+        if at_bottom or self.rp.busy:
+            imgui.set_scroll_here_y(1.0)
+
+    def _rp_bubble(self, t, n, turn, inner, av, gap, is_last):
+        is_user = turn["role"] == "user"
+        who = self.rp_user if is_user else self.rp.card.name
+        col = t.accent_bright if is_user else t.ok
+        edge = t.accent if is_user else t.ok
+        path = "" if is_user else (self.rp.card.avatar or "")
+        text = self.rp.text_of(turn) or ("..." if self.rp.busy and is_last else "")
+
+        row_x = imgui.get_cursor_screen_pos().x
+        dl = imgui.get_window_draw_list()
+        # avatar gutter on the left
+        self._avatar(dl, row_x + av / 2, imgui.get_cursor_screen_pos().y + av / 2 + 6,
+                     av / 2, who, col, path)
+        imgui.indent(av + gap)
+        with cards.card(None, width=inner, edge=edge, pad=ImVec2(14, 10)):
+            with fonts.use("label"):
+                imgui.text_colored(col, who.upper()[:28])
+            editing = self._rp_edit == n
+            if editing:
+                imgui.set_next_item_width(inner - 28)
+                chg, val = imgui.input_text_multiline("##edit", self._rp_edit_buf,
+                                                      ImVec2(inner - 28, 120),
+                                                      imgui.InputTextFlags_.word_wrap)
+                if chg:
+                    self._rp_edit_buf = val
+                if widgets.button("Salvar", 90, key="ed_ok"):
+                    self.rp.set_text(n, self._rp_edit_buf)
+                    self._rp_edit = -1
+                imgui.same_line(0, 8)
+                if widgets.button("Cancelar", 100, key="ed_no"):
+                    self._rp_edit = -1
+            else:
+                self._rp_text(t, text, inner - 28)
+                self._rp_controls(t, n, turn, is_user, is_last, inner - 28)
+        imgui.unindent(av + gap)
+
+    def _rp_controls(self, t, n, turn, is_user, is_last, w):
+        """A thin row of per-message actions that only shows on hover (or on the
+        last message), so the transcript stays clean."""
+        hovered = imgui.is_item_hovered(imgui.HoveredFlags_.allow_when_blocked_by_active_item) \
+            or imgui.is_mouse_hovering_rect(imgui.get_item_rect_min(), imgui.get_item_rect_max())
+        show = is_last or self._rp_ctrl_hot == n
+        if hovered:
+            self._rp_ctrl_hot = n
+        if not show:
+            return
+        imgui.dummy(ImVec2(0, 2))
+        busy = self.rp.busy
+        # swipe counter on the last assistant message
+        if not is_user and turn.get("alts") and (len(turn["alts"]) > 1 or is_last):
+            cur, tot = turn.get("alt", 0) + 1, len(turn["alts"])
+            if imgui.small_button("<") and not busy:
+                self.rp.swipe(n, -1)
+            imgui.same_line(0, 4)
+            imgui.text_colored(t.text_dim, f"{cur}/{tot}")
+            imgui.same_line(0, 4)
+            if imgui.small_button(">") and not busy:
+                self.rp.base = self.server.base
+                self.rp.swipe(n, +1)
+            imgui.same_line(0, 12)
+        if imgui.small_button("editar"):
+            self._rp_edit, self._rp_edit_buf = n, self.rp.text_of(turn)
+        imgui.same_line(0, 6)
+        if imgui.small_button("copiar"):
+            imgui.set_clipboard_text(self.rp.text_of(turn))
+        imgui.same_line(0, 6)
+        if imgui.small_button("apagar") and not busy:
+            self.rp.delete_turn(n)
+        if not is_user and is_last and not busy:
+            imgui.same_line(0, 6)
+            if imgui.small_button("continuar"):
+                self.rp.base = self.server.base
+                self.rp.continue_last()
+
+    def _rp_text(self, t, text, w):
+        """RP prose: *action* lines dimmed/italic-ish, plain speech normal."""
+        imgui.push_text_wrap_pos(imgui.get_cursor_pos().x + w)
+        for seg, is_action in self._split_actions(text):
+            if is_action:
+                imgui.text_colored(t.text_dim, seg)
+            else:
+                imgui.text_unformatted(seg)
+        imgui.pop_text_wrap_pos()
+
+    @staticmethod
+    def _split_actions(text):
+        # split on *...* so narration reads apart from speech
+        out, i = [], 0
+        for m in re.finditer(r"\*([^*]+)\*", text):
+            if m.start() > i:
+                out.append((text[i:m.start()], False))
+            out.append((m.group(1), True))
+            i = m.end()
+        if i < len(text):
+            out.append((text[i:], False))
+        return out or [(text, False)]
+
+    def _rp_input(self, t, w, h):
+        bw = 108.0
+        ready = self.server.ready and self.rp.card is not None
+        # a chat-bubble icon beside the input, as its emblem
+        dl = imgui.get_window_draw_list()
+        p = imgui.get_cursor_screen_pos()
+        ic = 40.0
+        dl.add_rect_filled(p, ImVec2(p.x + ic, p.y + h - 22), C(theme.with_alpha(t.surface, 0.9)), t.rounding)
+        self._bubble_glyph(dl, p.x + ic / 2, p.y + (h - 22) / 2, 10.0,
+                           C(t.accent_bright if ready else t.text_mute))
+        imgui.set_cursor_screen_pos(ImVec2(p.x + ic + 8, p.y))
+
+        if self.rp_focus:
+            imgui.set_keyboard_focus_here()
+            self.rp_focus = False
+        flags = (imgui.InputTextFlags_.enter_returns_true
+                 | imgui.InputTextFlags_.ctrl_enter_for_new_line)
+        imgui.push_style_color(imgui.Col_.frame_bg, t.surface)
+        sent, self.rp_prompt = imgui.input_text_multiline(
+            "##rpprompt", self.rp_prompt, ImVec2(w - bw - ic - 18, h - 22), flags)
+        imgui.pop_style_color()
+        imgui.same_line(0, 10)
+        if self.rp.busy:
+            if widgets.button("Parar", bw, height=h - 22, key="rp_stop"):
+                self.rp.stop()
+        else:
+            go = widgets.button("Enviar", bw, height=h - 22, primary=True,
+                                key="rp_send", enabled=ready and bool(self.rp_prompt.strip()))
+            if (go or sent) and ready and self.rp_prompt.strip():
+                self.rp.base = self.server.base
+                self.rp.send(self.rp_prompt.strip())
+                self.rp_prompt = ""
+                self.rp_focus = True
+        hint = "Enter envia · Ctrl+Enter quebra linha · passe o mouse numa fala para editar/swipe"
+        if not self.server.ready:
+            hint = "Ligue o modelo para conversar."
+        elif self.rp.card is None:
+            hint = "Escolha um personagem à esquerda."
+        imgui.text_colored(t.text_mute, hint)
+
     def _server_tab(self, t, pad):
         s = self.server
         imgui.text_colored(t.text_dim, f"{s.base}  ·  estado: {s.state}  ·  modelo: {s.model_key or '-'}"
@@ -679,8 +1222,7 @@ class App:
     def _settings_tab(self, t, pad):
         imgui.begin_child("settings", ImVec2(0, imgui.get_content_region_avail().y - 12))
         try:
-            secs = [x for x in settings.SECTIONS if x not in ("backdrop", "effects")]
-            settings.panel(self.st, self.log, sections=secs,
+            settings.panel(self.st, self.log, backdrop=self.bg, effects=self.fx,
                            on_change=lambda _s: (self.save(), self._apply_accent()))
         finally:
             imgui.end_child()

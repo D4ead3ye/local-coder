@@ -12,6 +12,11 @@ Local_Coder.ini
 **/.lcoder_web/
 **/.venv/
 
+# PyInstaller build output
+build/
+dist/
+*.spec
+
 # Python
 __pycache__/
 *.pyc

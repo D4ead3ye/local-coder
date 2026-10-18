@@ -17,7 +17,7 @@ from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
+from .paths import ROOT
 LLAMA_DIR = ROOT / "llama"
 MODELS_DIR = ROOT / "models"
 NCMOE = 24
@@ -31,6 +31,10 @@ class Model:
     note: str
     mmproj: str = ""       # vision projector; without it the model is text-only
     mtp: bool = False      # carries multi-token-prediction heads
+    moe: bool = True       # MoE (expert offload) vs dense (per-layer offload)
+    rp: bool = False       # tuned for roleplay; the RP mode prefers it
+    bytes_: int = 0        # expected complete size, to tell a finished file from a partial one
+    ctx: int = 65536       # preferred context for this model
 
     @property
     def path(self) -> Path:
@@ -39,9 +43,12 @@ class Model:
     @property
     def present(self) -> bool:
         p = self.path
-        # a file still downloading is present but useless; GGUF this size
-        # is never under 15 GB when complete
-        return p.exists() and p.stat().st_size > 15e9
+        if not p.exists():
+            return False
+        # a file still downloading looks present but is useless; accept only a
+        # file within 1% of the known complete size (or >13 GB if unknown)
+        n = p.stat().st_size
+        return n >= self.bytes_ * 0.99 if self.bytes_ else n > 13e9
 
     @property
     def vision(self) -> bool:
@@ -53,12 +60,20 @@ MODELS = [
     Model("normal", "Qwen3.6 35B-A3B",
           "Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf",
           "Melhor qualidade. Recusa raramente em código.",
-          mmproj="mmproj-qwen3.6-F16.gguf"),
+          mmproj="mmproj-qwen3.6-F16.gguf", bytes_=22360456160),
     Model("abliterated", "Qwen3.6 35B-A3B abliterated",
           "Huihui-Qwen3.6-35B-A3B-abliterated-Q4_K.gguf",
           "Sem recusas. Um pouco menos preciso.",
-          mmproj="mmproj-huihui-abliterated-f16.gguf", mtp=True),
+          mmproj="mmproj-huihui-abliterated-f16.gguf", mtp=True, bytes_=21712409824),
+    Model("cydonia", "Cydonia 24B (RP)",
+          "Cydonia-24B-v4-Q4_K_M.gguf",
+          "Tunado para roleplay (Mistral-Small). Prosa rica, mas ~7 tok/s nesta GPU.",
+          moe=False, rp=True, bytes_=14333910752, ctx=16384),
 ]
+
+
+def rp_model() -> "Model":
+    return next((m for m in MODELS if m.rp), MODELS[0])
 
 
 def model(key: str) -> Model:
@@ -154,13 +169,13 @@ class Server:
                 "-a", m.key,
                 "-np", "1",          # one agent, one slot: no idle KV/compute buffers
                 "-t", str(max(1, (os.cpu_count() or 12) // 2))]
-        if ncmoe > 0:
+        if m.moe and ncmoe > 0:
             args += ["-ngl", "99", "-ncmoe", str(ncmoe), "--fit", "off"]
         else:
-            # --fit picks how many expert layers stay on the CPU so the rest
-            # fills the GPU without spilling into shared memory
+            # dense models have no experts to offload; --fit sizes -ngl to fit
+            # the GPU. (Also the fallback path when the fixed split overflows.)
             args += ["--fit-target", "768"]
-        self._fallback = (model_key, ctx, mtp) if ncmoe > 0 else None
+        self._fallback = (model_key, ctx, mtp) if (m.moe and ncmoe > 0) else None
         if m.vision:
             args += ["--mmproj", str(MODELS_DIR / m.mmproj)]
         else:
