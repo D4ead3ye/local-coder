@@ -29,3 +29,6 @@ desktop.ini
 .vs/
 .idea/
 *.log
+
+# Your personal character cards & lorebooks stay local, never committed
+cards/

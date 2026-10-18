@@ -10,14 +10,17 @@
 # they sit next to run.py when running from source.
 
 param([string]$Name = "LocalCoder")
-$ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot
 
+# Everything goes through `python -m` so nothing depends on the Scripts dir
+# being on PATH. pip prints its "not on PATH" note to stderr, which PowerShell
+# 5.1 would otherwise turn into a terminating error, so we don't stop on it.
 Write-Host "Installing build dependencies..." -ForegroundColor Cyan
-python -m pip install --quiet --upgrade pyinstaller -r requirements.txt
+python -m pip install --quiet --upgrade --no-warn-script-location pyinstaller -r requirements.txt
+if ($LASTEXITCODE -ne 0) { Write-Host "pip install failed" -ForegroundColor Red; exit 1 }
 
 Write-Host "Building $Name ..." -ForegroundColor Cyan
-pyinstaller --noconfirm --clean --windowed --name $Name `
+python -m PyInstaller --noconfirm --clean --windowed --name $Name `
     --collect-all imgui_bundle `
     --collect-all vertexui `
     --hidden-import OpenGL --hidden-import OpenGL.GL `
@@ -25,8 +28,8 @@ pyinstaller --noconfirm --clean --windowed --name $Name `
     --hidden-import PIL --hidden-import PIL.Image --hidden-import PIL.ImageGrab `
     --hidden-import numpy `
     run.py
+if ($LASTEXITCODE -ne 0) { Write-Host "PyInstaller failed" -ForegroundColor Red; exit 1 }
 
-if ($LASTEXITCODE -ne 0) { throw "PyInstaller failed" }
 Write-Host ""
 Write-Host "Done -> dist\$Name\$Name.exe" -ForegroundColor Green
 Write-Host "Copy your 'llama\' and 'models\' folders into dist\$Name\ before running." -ForegroundColor Yellow
