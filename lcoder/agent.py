@@ -18,7 +18,8 @@ from . import llm, prompt, tools, vision
 
 MODES = ["auto", "edits", "ask"]
 MODE_LABELS = ["Autônomo total", "Pergunta antes de comandos", "Pergunta tudo"]
-SESSIONS = Path(__file__).resolve().parent.parent / "sessions"
+from .paths import ROOT
+SESSIONS = ROOT / "sessions"
 
 
 @dataclass

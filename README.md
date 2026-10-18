@@ -41,6 +41,19 @@ O código vive no repositório; os pesos do modelo (~44 GB) e a build do llama.c
 
 Pensado para uma RTX 5070 (12 GB) + 64 GB de RAM: o modelo é MoE (3B ativos) e o llama.cpp mantém parte dos experts na RAM (`-ncmoe`). Em outra placa, ajuste `NCMOE` em `lcoder/server.py` ou deixe o `--fit` automático.
 
+## Gerar o .exe
+
+Para um app que roda sem Python instalado (útil como backup):
+
+```powershell
+.\build.ps1
+```
+
+Isso gera `dist\LocalCoder\LocalCoder.exe`. Copie as pastas `llama\` e `models\`
+para dentro de `dist\LocalCoder\` (ao lado do .exe) antes de rodar — os pesos
+não são embutidos. O branch **`dev`** builda do mesmo jeito (`.\build.ps1 -Name LocalCoder-dev`)
+e inclui o modo de chat/RP.
+
 ## Rodar
 
 Dê dois cliques em **`Local Coder.bat`**, ou:

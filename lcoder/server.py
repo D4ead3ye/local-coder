@@ -17,7 +17,7 @@ from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
+from .paths import ROOT
 LLAMA_DIR = ROOT / "llama"
 MODELS_DIR = ROOT / "models"
 NCMOE = 24
