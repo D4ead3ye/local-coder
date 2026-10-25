@@ -63,6 +63,18 @@ def fmt_secs(s: float) -> str:
     return f"{s:.1f}s" if s < 60 else f"{int(s // 60)}m{int(s % 60):02d}s"
 
 
+def _fit(text: str, max_w: float) -> str:
+    """Trim text (with an ellipsis) to fit max_w in the current font, so a
+    wider themed face never spills out of a fixed box."""
+    if imgui.calc_text_size(text).x <= max_w:
+        return text
+    for n in range(len(text) - 1, 0, -1):
+        s = text[:n].rstrip() + "…"
+        if imgui.calc_text_size(s).x <= max_w:
+            return s
+    return "…"
+
+
 def _scrim_fn(dl, x, y, w, h, t, amount, rounding=0.0):
     if amount <= 0.004:
         return
@@ -316,11 +328,14 @@ class App:
                             C(acc if active else theme.with_alpha(t.border, 0.7)),
                             t.rounding, 1.6 if active else 1.0)  # p_min,p_max,col,rounding,thickness
                 self._profile_glyph(dl, p["icon"], pos.x + 17, pos.y + bh / 2, 9, C(acc))
+                tx, avail = pos.x + 32, bw - 32 - 6
+                dl.push_clip_rect(ImVec2(pos.x + 2, pos.y), ImVec2(pos.x + bw - 2, pos.y + bh), True)
                 with fonts.use("semi"):
-                    dl.add_text(ImVec2(pos.x + 32, pos.y + 10),
-                                C(t.text if active else t.text_dim), p["label"])
+                    dl.add_text(ImVec2(tx, pos.y + 10),
+                                C(t.text if active else t.text_dim), _fit(p["label"], avail))
                 with fonts.use("label"):
-                    dl.add_text(ImVec2(pos.x + 32, pos.y + 30), C(t.text_mute), p["tag"])
+                    dl.add_text(ImVec2(tx, pos.y + 30), C(t.text_mute), _fit(p["tag"], avail))
+                dl.pop_clip_rect()
                 if i == 0:
                     imgui.same_line(0, 10)
             note(prompt.profile(self.profile)["blurb"],
