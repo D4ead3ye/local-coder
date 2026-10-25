@@ -171,6 +171,7 @@ class App:
     def save(self):
         self.st.extras.update(model=self.model_key, ctx=self.ctx, mode=self.mode,
                               workspace=self.ws, profile=self.profile, look=self.look,
+                              port=self.server.port,
                               rp_dir=self.rp_dir, rp_user=self.rp_user,
                               rp_user_desc=self.rp_user_desc, rp_personas=self.rp_personas)
         try:
@@ -883,6 +884,7 @@ class App:
             go = widgets.button("Enviar", bw, height=h - 22, primary=True, key="send",
                                 enabled=ready and bool(self.prompt.strip()))
             if (go or sent) and ready and self.prompt.strip():
+                self.agent.base = self.server.base   # port may have moved
                 self.agent.ctx = self.server.ctx or self.ctx
                 self.agent.vision = self.server.vision
                 self.agent.send(self.prompt.strip(), images=self.attach)

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import subprocess
 import threading
 import time
@@ -81,6 +82,35 @@ def model(key: str) -> Model:
         if m.key == key:
             return m
     return MODELS[0]
+
+
+def _bindable(port: int) -> bool:
+    """True if we can actually bind 127.0.0.1:port right now. Catches both a
+    port in use AND a Windows *reserved* port range (Hyper-V/WSL grab ranges,
+    after which the OS refuses the bind and the real cause is invisible)."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 0)
+        s.bind(("127.0.0.1", port))
+        return True
+    except OSError:
+        return False
+    finally:
+        s.close()
+
+
+def _free_port(preferred: int) -> int:
+    """The preferred port if usable, else the next usable one, else an
+    OS-assigned ephemeral port."""
+    for p in [preferred] + [preferred + i for i in range(1, 40)]:
+        if _bindable(p):
+            return p
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+    finally:
+        s.close()
 
 
 class Server:
@@ -156,6 +186,13 @@ class Server:
         if not m.present:
             self.state, self.error = "error", f"modelo ausente ou incompleto: {m.file}"
             return
+        # the saved port may now be in a Windows reserved range (nothing binds
+        # it, the server would just exit "couldn't bind"); move to a free one
+        if not _bindable(self.port):
+            new = _free_port(self.port + 1)
+            self._push(f"[local coder] porta {self.port} indisponível (reservada/ocupada); usando {new}")
+            self.port = new
+            self.base = f"http://127.0.0.1:{self.port}"
         args = [str(exe), "-m", str(m.path),
                 "--host", "127.0.0.1", "--port", str(self.port),
                 "-c", str(ctx),
