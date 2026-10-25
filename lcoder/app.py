@@ -98,6 +98,8 @@ class App:
         self.ctx = int(ex.get("ctx", 65536))
         self.mode = ex.get("mode", "auto")
         self.profile = ex.get("profile", prompt.DEFAULT_PROFILE)
+        self.look = ex.get("look", "noir")   # VertexUI visual profile (identity)
+        self.look_plain = True
         self.ws = ex.get("workspace", str(DEFAULT_WS))
         self.tab = 0
         self.prompt = ""
@@ -156,7 +158,7 @@ class App:
 
     def save(self):
         self.st.extras.update(model=self.model_key, ctx=self.ctx, mode=self.mode,
-                              workspace=self.ws, profile=self.profile,
+                              workspace=self.ws, profile=self.profile, look=self.look,
                               rp_dir=self.rp_dir, rp_user=self.rp_user,
                               rp_user_desc=self.rp_user_desc, rp_personas=self.rp_personas)
         try:
@@ -188,9 +190,11 @@ class App:
         dlw = imgui.get_window_draw_list()
 
         # 1) GPU shader backdrop first, painting over the window's own fill.
-        self.bg.draw()
-        # 2) particles behind the content.
-        moving = self.fx.kind != "none" and self.fx.step(now, io.delta_time)
+        # a characterful look owns its own surface; the wallpaper is only for
+        # the plain NOIR look.
+        if self.look_plain:
+            self.bg.draw()
+        moving = self.look_plain and self.fx.kind != "none" and self.fx.step(now, io.delta_time)
         if moving:
             self.fx.paint(dlw, 0, 0, w, h, now, 1.0)
 
@@ -247,11 +251,47 @@ class App:
         return next((x for x in srv.MODELS if not x.rp and x.present), srv.MODELS[0])
 
     def _apply_accent(self):
-        """Give the live theme the active profile's accent, keeping the user's
-        chosen shape, fonts and palette from Settings."""
-        base = self.st.build_theme()
-        accent = theme.rgb(prompt.profile(self.profile)["accent"])
-        theme.use(base.with_accent(accent))
+        """Apply the chosen VertexUI look (a whole identity: palette, shape,
+        skin, spinner, fonts) and, on the plain NOIR look only, tint it with
+        the agent mode's accent. Characterful looks (ena-world etc.) own their
+        whole palette and get no wallpaper to fight."""
+        from vertexui import profiles
+        prof = profiles.get(self.look)
+        prof.apply(self.st.app)
+        self.look_plain = (self.look == "noir")
+        if self.look_plain:
+            base = self.st.build_theme()
+            accent = theme.rgb(prompt.profile(self.profile)["accent"])
+            theme.use(base.with_accent(accent))
+            try:
+                theme.apply_style(theme.current())   # needs an ImGui context
+            except Exception:
+                pass
+
+    def set_look(self, name):
+        if name == self.look:
+            return
+        self.look = name
+        self._apply_accent()
+        self.save()
+        vui.sound.play("click")
+
+    # the VertexUI looks worth offering, retro/characterful first
+    LOOKS = [("ena-world", "ENA World (Win9x retrô)"), ("frutiger-aero", "Frutiger Aero"),
+             ("ymo-technodelic", "YMO Technodelic"), ("y2k-cyber", "Y2K Cyber"),
+             ("steel-ball-run", "Steel Ball Run"), ("console", "Console (fósforo)"),
+             ("instrument", "Instrument (âmbar)"), ("noir", "Noir (padrão)")]
+
+    def _look_card(self, t):
+        with cards.card("visual", icon=None) as c:
+            keys = [k for k, _ in self.LOOKS]
+            labels = [lbl for _, lbl in self.LOOKS]
+            cur = keys.index(self.look) if self.look in keys else len(keys) - 1
+            new = widgets.combo("", labels, cur, width=c.width, key="look")
+            if new != cur:
+                self.set_look(keys[new])
+            note("Troca a cara inteira do app (paleta, formato, spinner, fonte). "
+                 "O ENA World é um Windows 9x retrô.")
 
     def _profile_card(self, t):
         """Two big profile buttons at the top of the sidebar. Switching changes
@@ -457,6 +497,8 @@ class App:
         s = self.server
         self._profile_card(t)
         imgui.dummy(ImVec2(0, 4))
+        self._look_card(t)
+        imgui.dummy(ImVec2(0, 4))
         with cards.card("modelo", icon="bolt",
                         right={"ready": "pronto", "external": "externo", "starting": "carregando",
                                "error": "erro", "off": "desligado"}[s.state],
@@ -593,9 +635,10 @@ class App:
                 imgui.pop_id()
             imgui.dummy(ImVec2(0, 4))
         if self.agent.busy:
-            k = int(time.time() * 3) % 4
-            live = self.agent.live_text()
-            imgui.text_colored(t.text_mute, (live or "trabalhando") + " " + "." * k)
+            widgets.spinner(20, key="work_spin", speed=1.2)
+            imgui.same_line(0, 10)
+            imgui.set_cursor_pos_y(imgui.get_cursor_pos_y() + 3)
+            imgui.text_colored(t.text_mute, self.agent.live_text() or "trabalhando")
         imgui.dummy(ImVec2(0, 10))
         if at_bottom or len(items) != self._last_items and self.agent.busy:
             imgui.set_scroll_here_y(1.0)
@@ -1133,7 +1176,10 @@ class App:
                 imgui.pop_id()
             imgui.dummy(ImVec2(0, 6))
         if self.rp.busy and (not self.rp.turns or self.rp.turns[-1]["role"] == "user"):
-            imgui.text_colored(t.text_mute, f"{self.rp.card.name} está digitando" + "." * (int(time.time() * 2) % 4))
+            widgets.spinner(18, key="rp_spin", speed=1.0)
+            imgui.same_line(0, 10)
+            imgui.set_cursor_pos_y(imgui.get_cursor_pos_y() + 2)
+            imgui.text_colored(t.text_mute, f"{self.rp.card.name} está digitando")
         imgui.dummy(ImVec2(0, 8))
         if at_bottom or self.rp.busy:
             imgui.set_scroll_here_y(1.0)
@@ -1312,5 +1358,11 @@ def run():
     app = App(st)
     params.callbacks.show_gui = app.frame
     params.callbacks.before_exit = app.shutdown
-    vui.install(params, theme_=st.build_theme(), faces=st.build_faces())
+    # load the chosen look's fonts/theme at startup, so a characterful look
+    # (ENA's serifs, etc.) is right on the first frame
+    from vertexui import profiles
+    prof = profiles.get(app.look)
+    theme_, faces = (prof.build_theme(), prof.build_faces()) if app.look != "noir" \
+        else (st.build_theme(), st.build_faces())
+    vui.install(params, theme_=theme_, faces=faces)
     hello_imgui.run(params)
