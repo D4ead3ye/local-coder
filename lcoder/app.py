@@ -25,6 +25,7 @@ from vertexui import (theme, widgets, cards, icons, logview, fonts, settings, an
 
 from . import server as srv
 from . import prompt
+from . import sysmon as sysmon_mod
 from . import rp as rp_mod
 from .agent import Agent, Item, MODES, MODE_LABELS
 
@@ -69,8 +70,28 @@ def _scrim_fn(dl, x, y, w, h, t, amount, rounding=0.0):
                        imgui.get_color_u32(theme.with_alpha(t.bg, min(1.0, amount))), rounding)
 
 
+def _seed_themes(app_name: str):
+    """Make VertexUI 1.13's characterful themes selectable in Settings by
+    registering them as presets. They fit a coding/tooling app: PHOSPHOR is a
+    green CRT console, SLATE an amber instrument, QUIET a calm cyan, PAPER a
+    light reading ground. Accent is still overridden per profile."""
+    try:
+        from vertexui import profiles
+    except Exception:
+        return
+    existing = set(theme.list_presets(app_name))
+    for attr in ("PHOSPHOR", "SLATE", "QUIET", "PAPER_WHITE"):
+        th = getattr(profiles, attr, None)
+        if th is not None and th.name not in existing:
+            try:
+                theme.save_preset(th, th.name, app=app_name)
+            except Exception:
+                pass
+
+
 class App:
     def __init__(self, st: settings.Settings):
+        _seed_themes(st.app)
         self.st = st
         ex = st.extras
         self.model_key = ex.get("model", "normal")
@@ -126,6 +147,7 @@ class App:
         self._screen_was = ("rp", self.tab)
         self._fade = 0.0
         self._tex: dict = {}                 # avatar path -> (texid, w, h) or None
+        self.sysmon = sysmon_mod.SysMon()    # background VRAM/RAM sampler
 
         if not self.server.adopt_existing() and srv.model(self.model_key).present:
             self.server.start(self.model_key, self.ctx)
@@ -214,6 +236,15 @@ class App:
                 pass
 
     # -- profile ---------------------------------------------------------
+
+    def _coding_model(self):
+        """The right coding model for the active profile: abliterated (no
+        refusals) for the game-tooling profile, else the best-quality one."""
+        want = "abliterated" if self.profile == "redhand" else "normal"
+        m = srv.model(want)
+        if m.present:
+            return m
+        return next((x for x in srv.MODELS if not x.rp and x.present), srv.MODELS[0])
 
     def _apply_accent(self):
         """Give the live theme the active profile's accent, keeping the user's
@@ -328,22 +359,43 @@ class App:
         else:
             word, on = ("PRONTO" if ready else "DESLIGADO"), False
 
-        # right-hand readouts: speed and context fill
-        x = o.x + w - 470
-        with fonts.use("label"):
-            widgets.caps(dl, x, o.y + 12, "VELOCIDADE", C(t.text_mute), 1.6)
-            widgets.caps(dl, x + 120, o.y + 12, "CONTEXTO", C(t.text_mute), 1.6)
-        tps = self.agent.last_tps
-        dl.add_text(ImVec2(x, o.y + 27), C(t.text if tps else t.text_mute),
-                    f"{tps:.1f} tok/s" if tps else "--")
+        # right-hand readouts: speed, context fill, VRAM, RAM
+        sm = self.sysmon
+        tps = self.agent.last_tps if not self.rp_mode else self.rp.last_tps
         used, cap = self.agent.ctx_used, max(1, s.ctx or self.ctx)
-        frac = min(1.0, used / cap)
-        dl.add_text(ImVec2(x + 120, o.y + 27), C(t.text_dim), f"{used // 1000}k / {cap // 1000}k")
-        cards.meter(dl, x + 120, x + 220, o.y + 46, frac,
-                    t.warn if frac > 0.75 else t.accent, t, h=3.0)
+        cfrac = min(1.0, used / cap)
+        col = 115
+        x = o.x + w - (col * 4 + 130)
+        tight = sm.vram_tight and s.ready
+        with fonts.use("label"):
+            for i, lab in enumerate(("VELOCIDADE", "CONTEXTO", "VRAM", "RAM")):
+                widgets.caps(dl, x + col * i, o.y + 10, lab, C(t.text_mute), 1.5)
+        # speed: red when it has collapsed while VRAM is pinned
+        slow = tps and tps < 10 and tight
+        dl.add_text(ImVec2(x, o.y + 25), C(t.danger if slow else (t.text if tps else t.text_mute)),
+                    f"{tps:.0f} tok/s" if tps else "--")
+        dl.add_text(ImVec2(x + col, o.y + 25), C(t.warn if cfrac > 0.75 else t.text_dim),
+                    f"{used // 1000}k/{cap // 1000}k")
+        cards.meter(dl, x + col, x + col + 95, o.y + 42, cfrac,
+                    t.warn if cfrac > 0.75 else t.accent, t, h=3.0)
+        if sm.has_gpu:
+            dl.add_text(ImVec2(x + col * 2, o.y + 25), C(t.danger if tight else t.text_dim),
+                        f"{sm.vram_used:.1f}/{sm.vram_total:.0f}G")
+            cards.meter(dl, x + col * 2, x + col * 2 + 95, o.y + 42, sm.vram_frac,
+                        t.danger if tight else (t.warn if sm.vram_frac > 0.85 else t.accent), t, h=3.0)
+            dl.add_text(ImVec2(x + col * 3, o.y + 25), C(t.text_dim),
+                        f"{sm.ram_used:.0f}/{sm.ram_total:.0f}G")
+            cards.meter(dl, x + col * 3, x + col * 3 + 95, o.y + 42,
+                        sm.ram_used / max(1.0, sm.ram_total), t.accent, t, h=3.0)
 
-        imgui.set_cursor_screen_pos(ImVec2(o.x + w - 220, o.y + 15))
+        imgui.set_cursor_screen_pos(ImVec2(o.x + w - 200, o.y + 13))
         widgets.status_pill(word, word, on=on, key="srv")
+        # the whole point: name the slowdown when VRAM is pinned
+        if slow:
+            with fonts.use("label"):
+                msg = "VRAM CHEIA — CACHE NA RAM, POR ISSO LENTO. REDUZA O CONTEXTO OU USE O QWEN MoE."
+                tw = widgets.caps_width(msg, 1.4)
+                widgets.caps(dl, o.x + w - tw - 16, o.y + h - 12, msg, C(t.danger), 1.4)
 
         # Semi-hidden entrance to the RP side: a small unlabeled speech bubble
         # in the far corner. Dim but visible, it brightens and shows a tooltip
@@ -417,6 +469,17 @@ class App:
                 self.save()
             note(srv.MODELS[new].note + ("  Enxerga imagens." if srv.MODELS[new].vision
                                           else "  Sem visão (mmproj ausente)."))
+            # A loaded RP model writes weak code. Warn and offer a one-click
+            # swap to the right coding model for this profile.
+            if s.ready and srv.model(s.model_key or "").rp:
+                cm = self._coding_model()
+                note(f"Modelo de RP carregado — ele escreve código fraco. Para código, "
+                     f"use o {cm.label}.", tone=t.danger)
+                if widgets.button(f"Trocar p/ {cm.label}", c.width, primary=True,
+                                  key="to_coding", enabled=cm.present and not self.agent.busy):
+                    self.model_key, self.ctx = cm.key, cm.ctx
+                    self.save()
+                    self.server.start(cm.key, cm.ctx)
             ci = CTX_OPTIONS.index(self.ctx) if self.ctx in CTX_OPTIONS else 1
             nci = widgets.combo("contexto", [f"{v // 1024}k tokens" for v in CTX_OPTIONS], ci,
                                 width=c.width - 80, key="ctx")
@@ -1231,6 +1294,7 @@ class App:
         self.agent.stop()
         self.agent.box.stop_all()
         self.server.stop()
+        self.sysmon.stop()
         self.save()
 
 
