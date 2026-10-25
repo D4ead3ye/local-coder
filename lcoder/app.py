@@ -17,7 +17,7 @@ import subprocess
 import time
 from pathlib import Path
 
-from imgui_bundle import hello_imgui, imgui, ImVec2
+from imgui_bundle import hello_imgui, imgui, ImVec2, ImVec4
 
 import vertexui as vui
 from vertexui import (theme, widgets, cards, icons, logview, fonts, settings, anim,
@@ -469,6 +469,30 @@ class App:
 
     # -- agent tab -------------------------------------------------------
 
+    def _win_begin(self, t, title, w, h, key, right=None, right_col=None):
+        """Frame a region as one of the theme's windows (plate + title bar) and
+        open a transparent scroll child inside it, so the main column reads as
+        panels of the same kind as the sidebar instead of loose content."""
+        dl = imgui.get_window_draw_list()
+        p = imgui.get_cursor_screen_pos()
+        cards.plate(dl, p.x, p.y, w, h, t)
+        if title:
+            cards.card_head(dl, p.x, p.y, w, t, None, title, right, right_col)
+        ip = 10.0
+        top = (cards.HEAD_H if title else ip)
+        imgui.set_cursor_screen_pos(ImVec2(p.x + ip, p.y + top))
+        imgui.push_style_color(imgui.Col_.child_bg, ImVec4(0, 0, 0, 0))
+        imgui.begin_child(key, ImVec2(w - ip * 2, h - top - ip))
+        return p
+
+    def _win_end(self, p, w, h):
+        imgui.end_child()
+        imgui.pop_style_color()
+        # the child only spans the inset; anchor the cursor just below the full
+        # plate so the next item starts there (0-height so no double spacing)
+        imgui.set_cursor_screen_pos(ImVec2(p.x, p.y + h))
+        imgui.dummy(ImVec2(w, 0.0))
+
     def _agent_tab(self, t, pad):
         avail = imgui.get_content_region_avail()
         h = avail.y - 12
@@ -480,16 +504,22 @@ class App:
         imgui.same_line(0, 14)
         imgui.begin_group()
         main_w = avail.x - SIDE_W - 14 - pad
-        input_h = 96.0
+        input_h = 104.0
         pending = next((i for i in self.agent.items if i.kind == "tool" and i.status == "approve"), None)
         banner = 64.0 if pending else 0.0
-        imgui.begin_child("chat", ImVec2(main_w, h - input_h - banner - 10))
+        chat_h = h - input_h - banner - 16
+        n = sum(1 for i in self.agent.items if i.kind == "tool")
+        right = f"{self.agent.steps} passos" if self.agent.items else None
+        p = self._win_begin(t, "transcrição", main_w, chat_h, "chat", right=right,
+                            right_col=t.text_dim)
         try:
-            self._transcript(t, main_w)
+            self._transcript(t, main_w - 24)
         finally:
-            imgui.end_child()
+            self._win_end(p, main_w, chat_h)
         if pending:
+            imgui.dummy(ImVec2(0, 6))
             self._approval_banner(t, pending, main_w)
+        imgui.dummy(ImVec2(0, 6))
         self._input(t, main_w, input_h)
         imgui.end_group()
 
@@ -805,7 +835,15 @@ class App:
         imgui.set_cursor_screen_pos(ImVec2(p.x, p.y + h + 6))
         imgui.dummy(ImVec2(w, 0))
 
-    def _input(self, t, w, h):
+    def _input(self, t, outer_w, outer_h):
+        # frame the input area as a theme window, like the panels around it
+        dl = imgui.get_window_draw_list()
+        wp = imgui.get_cursor_screen_pos()
+        cards.plate(dl, wp.x, wp.y, outer_w, outer_h, t)
+        ip = 10.0
+        imgui.set_cursor_screen_pos(ImVec2(wp.x + ip, wp.y + ip))
+        w = outer_w - ip * 2
+        field_h = outer_h - ip * 2 - 22      # room under it for the attach row
         bw = 112.0
         if self.focus_prompt:
             imgui.set_keyboard_focus_here()
@@ -814,8 +852,9 @@ class App:
                  | imgui.InputTextFlags_.ctrl_enter_for_new_line)
         imgui.push_style_color(imgui.Col_.frame_bg, t.surface)
         sent, self.prompt = imgui.input_text_multiline(
-            "##prompt", self.prompt, ImVec2(w - bw - 10, h - 22), flags)
+            "##prompt", self.prompt, ImVec2(w - bw - 10, field_h), flags)
         imgui.pop_style_color()
+        h = field_h + 22    # for the button height below, matching the field
         io = imgui.get_io()
         if imgui.is_item_focused() and io.key_ctrl and imgui.is_key_pressed(imgui.Key.v, False):
             self._paste_image()
@@ -912,12 +951,17 @@ class App:
         imgui.same_line(0, 14)
         imgui.begin_group()
         main_w = avail.x - SIDE_W - 14 - pad
-        input_h = 84.0
-        imgui.begin_child("rpchat", ImVec2(main_w, h - input_h - 10))
+        input_h = 92.0
+        chat_h = h - input_h - 16
+        title = (self.rp.card.name if self.rp.card else "roleplay")
+        p = self._win_begin(t, title, main_w, chat_h, "rpchat",
+                            right=f"{len(self.rp.turns)} msgs" if self.rp.turns else None,
+                            right_col=t.text_dim)
         try:
-            self._rp_chat(t, main_w)
+            self._rp_chat(t, main_w - 24)
         finally:
-            imgui.end_child()
+            self._win_end(p, main_w, chat_h)
+        imgui.dummy(ImVec2(0, 6))
         self._rp_input(t, main_w, input_h)
         imgui.end_group()
 
@@ -1281,14 +1325,19 @@ class App:
             out.append((text[i:], False))
         return out or [(text, False)]
 
-    def _rp_input(self, t, w, h):
+    def _rp_input(self, t, outer_w, outer_h):
         bw = 108.0
         ready = self.server.ready and self.rp.card is not None
-        # a chat-bubble icon beside the input, as its emblem
         dl = imgui.get_window_draw_list()
+        wp = imgui.get_cursor_screen_pos()
+        cards.plate(dl, wp.x, wp.y, outer_w, outer_h, t)
+        ip = 10.0
+        w = outer_w - ip * 2
+        h = outer_h - ip * 2 + 22
+        imgui.set_cursor_screen_pos(ImVec2(wp.x + ip, wp.y + ip))
         p = imgui.get_cursor_screen_pos()
         ic = 40.0
-        dl.add_rect_filled(p, ImVec2(p.x + ic, p.y + h - 22), C(theme.with_alpha(t.surface, 0.9)), t.rounding)
+        # a chat-bubble emblem beside the field
         self._bubble_glyph(dl, p.x + ic / 2, p.y + (h - 22) / 2, 10.0,
                            C(t.accent_bright if ready else t.text_mute))
         imgui.set_cursor_screen_pos(ImVec2(p.x + ic + 8, p.y))
