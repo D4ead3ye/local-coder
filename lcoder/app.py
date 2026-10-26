@@ -27,6 +27,7 @@ from . import server as srv
 from . import prompt
 from . import sysmon as sysmon_mod
 from . import audio as audio_mod
+from . import image as image_mod
 from . import rp as rp_mod
 from .agent import Agent, Item, MODES, MODE_LABELS
 
@@ -166,6 +167,8 @@ class App:
         self.sysmon = sysmon_mod.SysMon()    # background VRAM/RAM sampler
         self.audio = audio_mod.AudioTool()
         self.audio_focus = False
+        self.image = image_mod.ImageTool()
+        self.image_focus = False
 
         if not self.server.adopt_existing() and srv.model(self.model_key).present:
             self.server.start(self.model_key, self.ctx)
@@ -398,7 +401,7 @@ class App:
     TILES = [("agent", "AGENTE", "cube", "Escreve, compila e testa código. Mods e engenharia reversa.", False),
              ("audio", "ÁUDIO", "play", "Gera SFX e sons a partir de prompt. Música em breve.", False),
              ("rp", "ROLEPLAY", "hand", "Conversa com personagens. Cards, lorebooks, personas.", False),
-             ("image", "IMAGEM", "dot", "Geração de imagem local avançada.", True)]
+             ("image", "IMAGEM", "dot", "Geração de imagem local na GPU. SDXL e mais.", False)]
 
     def _home_page(self, t, pad):
         avail = imgui.get_content_region_avail()
@@ -1700,6 +1703,148 @@ class App:
         if r:
             self.audio.error = self.audio.export_wav(r)
 
+    # -- image tool ------------------------------------------------------
+
+    def _image_tab(self, t, pad):
+        im = self.image
+        avail = imgui.get_content_region_avail()
+        h = avail.y - 12
+        imgui.begin_child("imgside", ImVec2(SIDE_W, h))
+        try:
+            self._image_side(t, im)
+        finally:
+            imgui.end_child()
+        imgui.same_line(0, 14)
+        imgui.begin_group()
+        main_w = avail.x - SIDE_W - 14 - pad
+        input_h = 104.0
+        prev_h = h - input_h - 16
+        right = None
+        if im.last_path is not None and im.image is not None:
+            right = f"{im.image.width}x{im.image.height}"
+        p = self._win_begin(t, "imagem", main_w, prev_h, "wave",
+                            right=right, right_col=t.text_dim)
+        try:
+            self._image_preview(t, im, main_w - 24, prev_h - cards.HEAD_H - 20)
+        finally:
+            self._win_end(p, main_w, prev_h)
+        imgui.dummy(ImVec2(0, 6))
+        self._image_input(t, im, main_w, input_h)
+        imgui.end_group()
+
+    def _image_side(self, t, im):
+        with cards.card("modelo", icon=None) as c:
+            keys = [k for k, _ in image_mod.MODELS]
+            mi = keys.index(im.model) if im.model in keys else 0
+            nmi = widgets.combo("", [lbl for _, lbl in image_mod.MODELS], mi,
+                                width=c.width, key="img_model")
+            if keys[nmi] != im.model:
+                im.set_model(keys[nmi])
+            im.server.refresh_state()
+            if not im.server.available:
+                note("Modelo indisponível: o venv de IA (torch) não está instalado. "
+                     "Rode: python -m lcoder.neural_setup", tone=t.danger)
+            else:
+                stx = {"off": "desligado", "starting": "iniciando",
+                       "loading": "carregando modelo (1ª vez baixa os pesos)",
+                       "ready": "pronto" + (f" · {im.server.device}" if im.server.device else ""),
+                       "generating": "renderizando...", "error": "erro",
+                       "missing": "indisponível"}.get(im.server.state, im.server.state)
+                tone = (t.danger if im.server.state in ("error", "missing") else
+                        t.warn if im.server.state in ("loading", "starting") else t.ok)
+                imgui.text_colored(tone, "gpu: " + stx)
+        imgui.dummy(ImVec2(0, 4))
+        with cards.card("parâmetros", icon=None) as c:
+            im.steps = int(widgets.slider("passos", float(im.steps), 1, 60,
+                                          width=c.width - 90, fmt="%.0f", key="img_steps"))
+            im.guidance = widgets.slider("guidance", im.guidance, 0.0, 15.0,
+                                         width=c.width - 90, fmt="%.1f", key="img_guid")
+            sizes = [512, 768, 1024]
+            si = sizes.index(im.size) if im.size in sizes else len(sizes) - 1
+            nsi = widgets.combo("tamanho", [f"{s}px" for s in sizes], si,
+                                width=c.width - 90, key="img_size")
+            im.size = sizes[nsi]
+            im.seed = imgui.slider_int("seed", im.seed, 0, 999999)[1]
+            note("seed 0 = aleatório a cada geração. SDXL rende em 1024; turbo "
+                 "usa poucos passos e guidance 0.")
+        imgui.dummy(ImVec2(0, 4))
+        with cards.card("exportar", icon=None) as c:
+            if widgets.button("Salvar PNG", c.width, key="img_png",
+                              enabled=im.last_path is not None):
+                self._image_save()
+            note("As imagens também ficam em output/images/ automaticamente.")
+        if im.error:
+            imgui.dummy(ImVec2(0, 4))
+            note(im.error, tone=t.danger)
+
+    def _image_preview(self, t, im, w, h):
+        dl = imgui.get_window_draw_list()
+        p = imgui.get_cursor_screen_pos()
+        if im.last_path is None:
+            txt = "Descreva uma imagem e gere."
+            tw = imgui.calc_text_size(txt).x
+            dl.add_text(ImVec2(p.x + max(8.0, (w - tw) / 2), p.y + h / 2 - 9),
+                        C(t.text_dim), txt)
+            imgui.dummy(ImVec2(w, h))
+            return
+        tex = self._avatar_tex(str(im.last_path))
+        if not tex or not tex[1]:
+            imgui.dummy(ImVec2(w, h))
+            return
+        tid, iw, ih = tex
+        scale = min(w / iw, h / ih)
+        dw, dh = iw * scale, ih * scale
+        ox, oy = p.x + (w - dw) / 2, p.y + (h - dh) / 2
+        dl.add_image(tid, ImVec2(ox, oy), ImVec2(ox + dw, oy + dh))
+        imgui.dummy(ImVec2(w, h))
+
+    def _image_input(self, t, im, outer_w, outer_h):
+        dl = imgui.get_window_draw_list()
+        wp = imgui.get_cursor_screen_pos()
+        cards.plate(dl, wp.x, wp.y, outer_w, outer_h, t)
+        ip = 10.0
+        imgui.set_cursor_screen_pos(ImVec2(wp.x + ip, wp.y + ip))
+        w = outer_w - ip * 2
+        field_h = outer_h - ip * 2 - 22
+        bw = 108.0
+        if self.image_focus:
+            imgui.set_keyboard_focus_here()
+            self.image_focus = False
+        flags = imgui.InputTextFlags_.enter_returns_true
+        imgui.push_style_color(imgui.Col_.frame_bg, t.surface)
+        sent, im.prompt = imgui.input_text_multiline("##imgprompt", im.prompt,
+                                                     ImVec2(w - bw - 10, field_h), flags)
+        imgui.pop_style_color()
+        imgui.same_line(0, 10)
+        imgui.begin_group()
+        if im.busy:
+            widgets.spinner(20, key="img_spin")
+        else:
+            if (widgets.button("Gerar", bw, height=field_h, primary=True,
+                               key="img_gen", enabled=bool(im.prompt.strip())) or sent) \
+                    and im.prompt.strip():
+                im.generate()
+                self.image_focus = True
+        imgui.end_group()
+        imgui.text_colored(t.text_mute, "Enter gera · a 1ª geração baixa/carrega o "
+                           "modelo (pode levar minutos) · salva em output/images/")
+
+    def _image_save(self):
+        if self.image.last_path is None:
+            return
+        try:
+            from imgui_bundle import portable_file_dialogs as pfd
+            r = pfd.save_file("Salvar PNG", "imagem.png", ["PNG", "*.png"]).result()
+        except Exception:
+            r = ""
+        if r:
+            try:
+                import shutil
+                shutil.copyfile(self.image.last_path, r)
+                self.image.error = f"salvo: {r}"
+            except Exception as e:
+                self.image.error = f"salvar: {e}"
+
     def _server_tab(self, t, pad):
         s = self.server
         imgui.text_colored(t.text_dim, f"{s.base}  ·  estado: {s.state}  ·  modelo: {s.model_key or '-'}"
@@ -1721,6 +1866,7 @@ class App:
         self.server.stop()
         self.sysmon.stop()
         self.audio.neural.stop()
+        self.image.stop()
         self.save()
 
 
@@ -1741,8 +1887,9 @@ class Shell(compose.Module):
         app.page("home", "Hub", icon="bolt", draw=p(s._home_page), order=-1)
         app.page("agent", "Agente", icon="bolt", draw=p(s._agent_tab), order=0)
         app.page("audio", "Áudio", icon="play", draw=p(s._audio_tab), order=1)
-        app.page("server", "Servidor", icon="gear", draw=p(s._server_tab), order=2)
-        app.page("settings", "Ajustes", icon="gear", draw=p(s._settings_tab), order=3)
+        app.page("image", "Imagem", icon="dot", draw=p(s._image_tab), order=2)
+        app.page("server", "Servidor", icon="gear", draw=p(s._server_tab), order=3)
+        app.page("settings", "Ajustes", icon="gear", draw=p(s._settings_tab), order=4)
         app.slot("status", lambda a: s._status())
         app.slot("overlay", lambda a: s._rp_overlay())
 

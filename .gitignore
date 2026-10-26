@@ -35,3 +35,6 @@ cards/
 
 # AI venv (torch/diffusers for neural audio/image)
 ai-venv/
+
+# Generated images (saved automatically by the image tool)
+output/
