@@ -393,6 +393,93 @@ class App:
                      ImVec2(cx, cy + r), ImVec2(cx + r * 0.86, cy + r * 0.5)]
             dl.add_convex_poly_filled(right, C(theme.with_alpha(theme.current().accent_bright, 0.9)))
 
+    # -- hub home --------------------------------------------------------
+
+    TILES = [("agent", "AGENTE", "cube", "Escreve, compila e testa código. Mods e engenharia reversa.", False),
+             ("audio", "ÁUDIO", "play", "Gera SFX e sons a partir de prompt. Música em breve.", False),
+             ("rp", "ROLEPLAY", "hand", "Conversa com personagens. Cards, lorebooks, personas.", False),
+             ("image", "IMAGEM", "dot", "Geração de imagem local avançada.", True)]
+
+    def _home_page(self, t, pad):
+        avail = imgui.get_content_region_avail()
+        with fonts.use("title"):
+            imgui.text("LOCAL CODER")
+        imgui.same_line(0, 12)
+        imgui.set_cursor_pos_y(imgui.get_cursor_pos_y() + 6)
+        imgui.text_colored(t.text_dim, "HUB DE IA LOCAL")
+        imgui.dummy(ImVec2(0, 10))
+        # tool tiles, two per row
+        cols = 2
+        gap = 14.0
+        tw = (avail.x - pad - gap * (cols - 1)) / cols
+        for i, (key, title, icon, desc, soon) in enumerate(self.TILES):
+            if i % cols:
+                imgui.same_line(0, gap)
+            self._tile(t, key, title, icon, desc, soon, tw)
+        imgui.dummy(ImVec2(0, 6))
+        # runtime strip
+        with cards.card("runtime", icon="bolt") as c:
+            self._runtime_row(t, c.width)
+
+    def _tile(self, t, key, title, icon, desc, soon, w):
+        dl = imgui.get_window_draw_list()
+        pos = imgui.get_cursor_screen_pos()
+        bh = 118.0
+        imgui.begin_group()
+        cards.plate(dl, pos.x, pos.y, w, bh, t,
+                    edge=(t.text_mute if soon else t.accent))
+        hov = imgui.is_mouse_hovering_rect(pos, ImVec2(pos.x + w, pos.y + bh)) and not soon
+        self._profile_glyph(dl, icon, pos.x + 34, pos.y + 36, 16,
+                            C(t.text_mute if soon else t.accent_bright)) \
+            if icon in ("hand", "cube") else \
+            icons.draw(icon, dl, pos.x + 34, pos.y + 36, 13,
+                       C(t.text_mute if soon else t.accent_bright))
+        with fonts.use("semi"):
+            dl.add_text(ImVec2(pos.x + 62, pos.y + 22), C(t.text_mute if soon else t.text), title)
+        if soon:
+            with fonts.use("label"):
+                dl.add_text(ImVec2(pos.x + 62, pos.y + 44), C(t.warn), "EM BREVE")
+        imgui.set_cursor_screen_pos(ImVec2(pos.x + 18, pos.y + 66))
+        imgui.push_text_wrap_pos(pos.x + w - 18)
+        imgui.text_colored(t.text_dim, desc)
+        imgui.pop_text_wrap_pos()
+        # clickable surface
+        imgui.set_cursor_screen_pos(pos)
+        if imgui.invisible_button(f"##tile{key}", ImVec2(w, bh)) and not soon:
+            self._open_tool(key)
+        if hov:
+            dl.add_rect(pos, ImVec2(pos.x + w, pos.y + bh),
+                        C(theme.with_alpha(t.accent, 0.8)), t.rounding, 0, 2.0)
+        imgui.end_group()
+
+    def _open_tool(self, key):
+        if key == "rp":
+            self.enter_rp()
+        elif self.capp is not None:
+            self.capp.go(key)
+        vui.sound.play("click")
+
+    def _runtime_row(self, t, w):
+        s = self.server
+        labels = [m.label + ("" if m.present else "  (baixando)") for m in srv.MODELS]
+        idx = next((i for i, m in enumerate(srv.MODELS) if m.key == self.model_key), 0)
+        new = widgets.combo("", labels, idx, width=w - 150, key="rt_model")
+        if new != idx:
+            self.model_key = srv.MODELS[new].key
+            self.save()
+        imgui.same_line(0, 10)
+        if s.state == "starting":
+            if widgets.button("Cancelar", 130, key="rt_cancel"):
+                s.stop()
+        elif s.ready:
+            if widgets.button("Desligar", 130, key="rt_stop", enabled=not self.agent.busy):
+                s.stop()
+        else:
+            if widgets.button("Ligar modelo", 130, primary=True, key="rt_start",
+                              enabled=srv.model(self.model_key).present and not self.agent.busy):
+                self.server.start(self.model_key, self.ctx)
+        self._status()
+
     def _status(self):
         """The status strip the layout places (dense: top bar; tabbed/rail:
         header). Compact, drawn inline so any layout can host it."""
@@ -1609,6 +1696,7 @@ class Shell(compose.Module):
         self.state.capp = app
         s = self.state
         p = lambda fn: (lambda a: fn(theme.current(), 16.0))
+        app.page("home", "Hub", icon="bolt", draw=p(s._home_page), order=-1)
         app.page("agent", "Agente", icon="bolt", draw=p(s._agent_tab), order=0)
         app.page("audio", "Áudio", icon="play", draw=p(s._audio_tab), order=1)
         app.page("server", "Servidor", icon="gear", draw=p(s._server_tab), order=2)

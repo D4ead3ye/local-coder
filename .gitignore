@@ -32,3 +32,6 @@ desktop.ini
 
 # Your personal character cards & lorebooks stay local, never committed
 cards/
+
+# AI venv (torch/diffusers for neural audio/image)
+ai-venv/
