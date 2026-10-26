@@ -17,6 +17,8 @@ import subprocess
 import time
 from pathlib import Path
 
+import numpy as np
+
 from imgui_bundle import hello_imgui, imgui, ImVec2, ImVec4
 
 import vertexui as vui
@@ -164,6 +166,8 @@ class App:
         self._screen_was = ("rp", self.tab)
         self._fade = 0.0
         self._tex: dict = {}                 # avatar path -> (texid, w, h) or None
+        self._tex_keep: dict = {}            # path -> ImageAndSize, kept alive so
+                                             # the GPU texture is not freed (id reused)
         self.sysmon = sysmon_mod.SysMon()    # background VRAM/RAM sampler
         self.audio = audio_mod.AudioTool()
         self.audio_focus = False
@@ -1347,14 +1351,18 @@ class App:
             return self._tex[path]
         out = None
         try:
-            data = Path(path).read_bytes()
-            r = hello_imgui.image_and_size_from_encoded_data(data)
-            # returns (TextureGpu-ish, size) or (texid, w, h) depending on build
-            if isinstance(r, (tuple, list)) and len(r) >= 2:
-                tid = r[0]
-                sz = r[-1]
-                out = (int(tid) if not hasattr(tid, "texture_id") else int(tid.texture_id),
-                       getattr(sz, "x", 0), getattr(sz, "y", 0))
+            # Upload the decoded RGBA ourselves: image_and_size_from_encoded_data
+            # hands back texture_id 1 (the font atlas) on this backend, which
+            # paints glyph garbage. create_texture_gpu_from_rgba_data gives a
+            # real owning handle we keep alive so the GPU texture is not freed.
+            from PIL import Image
+            img = Image.open(path).convert("RGBA")
+            arr = np.asarray(img, dtype=np.uint8)
+            tg = hello_imgui.create_texture_gpu_from_rgba_data(arr)
+            self._tex_keep[path] = tg      # owning handle; drop = free
+            # texture_id is a bound method on this binding; width/height are values
+            v = lambda a: a() if callable(a) else a
+            out = (int(v(tg.texture_id)), int(v(tg.width)), int(v(tg.height)))
         except Exception:
             out = None
         self._tex[path] = out
@@ -1796,7 +1804,8 @@ class App:
         scale = min(w / iw, h / ih)
         dw, dh = iw * scale, ih * scale
         ox, oy = p.x + (w - dw) / 2, p.y + (h - dh) / 2
-        dl.add_image(tid, ImVec2(ox, oy), ImVec2(ox + dw, oy + dh))
+        dl.add_image(imgui.ImTextureRef(int(tid)), ImVec2(ox, oy),
+                     ImVec2(ox + dw, oy + dh))
         imgui.dummy(ImVec2(w, h))
 
     def _image_input(self, t, im, outer_w, outer_h):
