@@ -12,20 +12,27 @@ frame spent on decoration is VRAM and time taken from generation.
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import time
 from pathlib import Path
 
-from imgui_bundle import hello_imgui, imgui, ImVec2
+import numpy as np
+
+from imgui_bundle import hello_imgui, imgui, ImVec2, ImVec4
 
 import vertexui as vui
-from vertexui import theme, widgets, cards, icons, logview, fonts, settings, anim
+from vertexui import (theme, widgets, cards, icons, logview, fonts, settings, anim,
+                      effects as fx_mod, backdrop as bg_mod, compose, profiles)
 
 from . import server as srv
 from . import prompt
+from . import sysmon as sysmon_mod
+from . import audio as audio_mod
+from . import image as image_mod
 from .agent import Agent, Item, MODES, MODE_LABELS
 
-TABS = ["Agente", "Servidor", "Ajustes"]
+TABS = ["Agente", "Áudio", "Servidor", "Ajustes"]
 CTX_OPTIONS = [32768, 65536, 98304, 131072]
 DEFAULT_WS = srv.ROOT / "workspace"
 SIDE_W = 300.0
@@ -59,14 +66,56 @@ def fmt_secs(s: float) -> str:
     return f"{s:.1f}s" if s < 60 else f"{int(s // 60)}m{int(s % 60):02d}s"
 
 
+def _fit(text: str, max_w: float) -> str:
+    """Trim text (with an ellipsis) to fit max_w in the current font, so a
+    wider themed face never spills out of a fixed box."""
+    if imgui.calc_text_size(text).x <= max_w:
+        return text
+    for n in range(len(text) - 1, 0, -1):
+        s = text[:n].rstrip() + "…"
+        if imgui.calc_text_size(s).x <= max_w:
+            return s
+    return "…"
+
+
+def _scrim_fn(dl, x, y, w, h, t, amount, rounding=0.0):
+    if amount <= 0.004:
+        return
+    dl.add_rect_filled(ImVec2(x, y), ImVec2(x + w, y + h),
+                       imgui.get_color_u32(theme.with_alpha(t.bg, min(1.0, amount))), rounding)
+
+
+def _seed_themes(app_name: str):
+    """Make VertexUI 1.13's characterful themes selectable in Settings by
+    registering them as presets. They fit a coding/tooling app: PHOSPHOR is a
+    green CRT console, SLATE an amber instrument, QUIET a calm cyan, PAPER a
+    light reading ground. Accent is still overridden per profile."""
+    try:
+        from vertexui import profiles
+    except Exception:
+        return
+    existing = set(theme.list_presets(app_name))
+    for attr in ("PHOSPHOR", "SLATE", "QUIET", "PAPER_WHITE"):
+        th = getattr(profiles, attr, None)
+        if th is not None and th.name not in existing:
+            try:
+                theme.save_preset(th, th.name, app=app_name)
+            except Exception:
+                pass
+
+
 class App:
     def __init__(self, st: settings.Settings):
+        _seed_themes(st.app)
         self.st = st
         ex = st.extras
         self.model_key = ex.get("model", "normal")
         self.ctx = int(ex.get("ctx", 65536))
         self.mode = ex.get("mode", "auto")
         self.profile = ex.get("profile", prompt.DEFAULT_PROFILE)
+        self.look = ex.get("look", "noir")   # VertexUI visual profile (identity)
+        self.capp = None                     # the compose.App, set by Shell.setup
+        self.look_plain = True
         self.ws = ex.get("workspace", str(DEFAULT_WS))
         self.tab = 0
         self.prompt = ""
@@ -75,7 +124,6 @@ class App:
         self.stick = True                   # transcript follows the bottom
         self._last_items = 0
         self.attach: list[str] = []         # images going with the next prompt
-
         self.server = srv.Server(int(ex.get("port", 8089)))
         self.log = logview.LogView(speed="calm", timestamps=True, tags=True)
         self.st.apply(self.log)
@@ -86,6 +134,27 @@ class App:
         self.agent.on_event = self._agent_event
         self._apply_accent()
 
+        # Style layer: a GPU shader backdrop and drifting particles, like the
+        # OctoView/Bedside apps. First run seeds a look worth showing.
+        if not ex.get("styled"):
+            st.backdrop, st.backdrop_intensity, st.backdrop_speed = "nebula", 0.6, 0.5
+            st.effect, st.effect_over = "embers", 0.3
+            st.card_style = "raised"
+            ex["styled"] = True
+        self.fx = fx_mod.Effects(st.effect)
+        self.bg = bg_mod.Backdrop(st.backdrop)
+        self.st.apply(self.log, backdrop=self.bg, effects=self.fx)
+        self._screen_was = ("code", self.tab)
+        self._fade = 0.0
+        self._tex: dict = {}                 # avatar path -> (texid, w, h) or None
+        self._tex_keep: dict = {}            # path -> ImageAndSize, kept alive so
+                                             # the GPU texture is not freed (id reused)
+        self.sysmon = sysmon_mod.SysMon()    # background VRAM/RAM sampler
+        self.audio = audio_mod.AudioTool()
+        self.audio_focus = False
+        self.image = image_mod.ImageTool()
+        self.image_focus = False
+
         if not self.server.adopt_existing() and srv.model(self.model_key).present:
             self.server.start(self.model_key, self.ctx)
 
@@ -93,7 +162,8 @@ class App:
 
     def save(self):
         self.st.extras.update(model=self.model_key, ctx=self.ctx, mode=self.mode,
-                              workspace=self.ws, profile=self.profile)
+                              workspace=self.ws, profile=self.profile, look=self.look,
+                              port=self.server.port)
         try:
             self.st.save()
         except Exception:
@@ -117,6 +187,20 @@ class App:
     def frame(self):
         self.pump_log()
         t = theme.current()
+        io = imgui.get_io()
+        now = imgui.get_time()
+        w, h = io.display_size.x, io.display_size.y
+        dlw = imgui.get_window_draw_list()
+
+        # 1) GPU shader backdrop first, painting over the window's own fill.
+        # a characterful look owns its own surface; the wallpaper is only for
+        # the plain NOIR look.
+        if self.look_plain:
+            self.bg.draw()
+        moving = self.look_plain and self.fx.kind != "none" and self.fx.step(now, io.delta_time)
+        if moving:
+            self.fx.paint(dlw, 0, 0, w, h, now, 1.0)
+
         imgui.push_style_var(imgui.StyleVar_.window_padding, ImVec2(0, 0))
         self._topbar(t)
         imgui.pop_style_var()
@@ -124,10 +208,28 @@ class App:
         pad = 16.0
         imgui.dummy(ImVec2(0, 2))
         imgui.indent(pad)
+        # a wash behind bare text so the moving backdrop never eats legibility
+        if self.tab in (1, 2):
+            _scrim_fn(dlw, 0, 56, w, h - 56, t, 0.5)
         self.tab = widgets.tabs("nav", TABS, self.tab)
         imgui.dummy(ImVec2(0, 6))
-        [self._agent_tab, self._server_tab, self._settings_tab][self.tab](t, pad)
+        [self._agent_tab, self._audio_tab, self._server_tab,
+         self._settings_tab][self.tab](t, pad)
         imgui.unindent(pad)
+
+        # 3) particles again over the top, drifting across the panels.
+        if moving and self.st.effect_over > 0.004:
+            self.fx.paint(dlw, 0, 0, w, h, now, self.st.effect_over)
+        # 4) a short fade over any screen change reads as navigation.
+        screen = ("code", self.tab)
+        if screen != self._screen_was:
+            self._screen_was = screen
+            self._fade = 1.0
+        if self._fade > 0.004:
+            self._fade = max(0.0, self._fade - io.delta_time * 4.5)
+            dlw.add_rect_filled(ImVec2(0, 0), ImVec2(w, h),
+                                C(theme.with_alpha(t.bg, self._fade * 0.6)))
+            anim.mark_busy()
 
         vui.end_frame()
         # tokens arrive from another thread with no input event to wake the
@@ -140,12 +242,60 @@ class App:
 
     # -- profile ---------------------------------------------------------
 
+    def _coding_model(self):
+        """The right coding model for the active profile: abliterated (no
+        refusals) for the game-tooling profile, else the best-quality one."""
+        want = "abliterated" if self.profile == "redhand" else "normal"
+        m = srv.model(want)
+        if m.present:
+            return m
+        return next((x for x in srv.MODELS if x.present), srv.MODELS[0])
+
     def _apply_accent(self):
-        """Give the live theme the active profile's accent, keeping the user's
-        chosen shape, fonts and palette from Settings."""
-        base = self.st.build_theme()
-        accent = theme.rgb(prompt.profile(self.profile)["accent"])
-        theme.use(base.with_accent(accent))
+        """Apply the chosen VertexUI look (a whole identity: palette, shape,
+        skin, spinner, fonts) and, on the plain NOIR look only, tint it with
+        the agent mode's accent. Characterful looks (ena-world etc.) own their
+        whole palette and get no wallpaper to fight."""
+        from vertexui import profiles
+        prof = profiles.get(self.look)
+        prof.apply(self.st.app)
+        self.look_plain = (self.look == "noir")
+        if self.look_plain:
+            base = self.st.build_theme()
+            accent = theme.rgb(prompt.profile(self.profile)["accent"])
+            theme.use(base.with_accent(accent))
+            try:
+                theme.apply_style(theme.current())   # needs an ImGui context
+            except Exception:
+                pass
+
+    def set_look(self, name):
+        if name == self.look:
+            return
+        self.look = name
+        if self.capp is not None:
+            # swap the whole identity AND the layout live, so the app reshapes
+            self.capp.profile = profiles.get(name)
+        self._apply_accent()
+        self.save()
+        vui.sound.play("click")
+
+    # the VertexUI looks worth offering, retro/characterful first
+    LOOKS = [("ena-world", "ENA World (Win9x retrô)"), ("frutiger-aero", "Frutiger Aero"),
+             ("ymo-technodelic", "YMO Technodelic"), ("y2k-cyber", "Y2K Cyber"),
+             ("steel-ball-run", "Steel Ball Run"), ("console", "Console (fósforo)"),
+             ("instrument", "Instrument (âmbar)"), ("noir", "Noir (padrão)")]
+
+    def _look_card(self, t):
+        with cards.card("visual", icon=None) as c:
+            keys = [k for k, _ in self.LOOKS]
+            labels = [lbl for _, lbl in self.LOOKS]
+            cur = keys.index(self.look) if self.look in keys else len(keys) - 1
+            new = widgets.combo("", labels, cur, width=c.width, key="look")
+            if new != cur:
+                self.set_look(keys[new])
+            note("Troca a cara inteira do app (paleta, formato, spinner, fonte). "
+                 "O ENA World é um Windows 9x retrô.")
 
     def _profile_card(self, t):
         """Two big profile buttons at the top of the sidebar. Switching changes
@@ -170,11 +320,14 @@ class App:
                             C(acc if active else theme.with_alpha(t.border, 0.7)),
                             t.rounding, 1.6 if active else 1.0)  # p_min,p_max,col,rounding,thickness
                 self._profile_glyph(dl, p["icon"], pos.x + 17, pos.y + bh / 2, 9, C(acc))
+                tx, avail = pos.x + 32, bw - 32 - 6
+                dl.push_clip_rect(ImVec2(pos.x + 2, pos.y), ImVec2(pos.x + bw - 2, pos.y + bh), True)
                 with fonts.use("semi"):
-                    dl.add_text(ImVec2(pos.x + 32, pos.y + 10),
-                                C(t.text if active else t.text_dim), p["label"])
+                    dl.add_text(ImVec2(tx, pos.y + 10),
+                                C(t.text if active else t.text_dim), _fit(p["label"], avail))
                 with fonts.use("label"):
-                    dl.add_text(ImVec2(pos.x + 32, pos.y + 30), C(t.text_mute), p["tag"])
+                    dl.add_text(ImVec2(tx, pos.y + 30), C(t.text_mute), _fit(p["tag"], avail))
+                dl.pop_clip_rect()
                 if i == 0:
                     imgui.same_line(0, 10)
             note(prompt.profile(self.profile)["blurb"],
@@ -223,6 +376,114 @@ class App:
                      ImVec2(cx, cy + r), ImVec2(cx + r * 0.86, cy + r * 0.5)]
             dl.add_convex_poly_filled(right, C(theme.with_alpha(theme.current().accent_bright, 0.9)))
 
+    # -- hub home --------------------------------------------------------
+
+    TILES = [("agent", "AGENTE", "cube", "Escreve, compila e testa código. Mods e engenharia reversa.", False),
+             ("audio", "ÁUDIO", "play", "Gera SFX e sons a partir de prompt. Música em breve.", False),
+             ("image", "IMAGEM", "dot", "Geração de imagem local na GPU. SDXL e mais.", False)]
+
+    def _home_page(self, t, pad):
+        avail = imgui.get_content_region_avail()
+        with fonts.use("title"):
+            imgui.text("LOCAL CODER")
+        imgui.same_line(0, 12)
+        imgui.set_cursor_pos_y(imgui.get_cursor_pos_y() + 6)
+        imgui.text_colored(t.text_dim, "HUB DE IA LOCAL")
+        imgui.dummy(ImVec2(0, 10))
+        # tool tiles, two per row
+        cols = 2
+        gap = 14.0
+        tw = (avail.x - pad - gap * (cols - 1)) / cols
+        for i, (key, title, icon, desc, soon) in enumerate(self.TILES):
+            if i % cols:
+                imgui.same_line(0, gap)
+            self._tile(t, key, title, icon, desc, soon, tw)
+        imgui.dummy(ImVec2(0, 6))
+        # runtime strip
+        with cards.card("runtime", icon="bolt") as c:
+            self._runtime_row(t, c.width)
+
+    def _tile(self, t, key, title, icon, desc, soon, w):
+        dl = imgui.get_window_draw_list()
+        pos = imgui.get_cursor_screen_pos()
+        bh = 118.0
+        imgui.begin_group()
+        cards.plate(dl, pos.x, pos.y, w, bh, t,
+                    edge=(t.text_mute if soon else t.accent))
+        hov = imgui.is_mouse_hovering_rect(pos, ImVec2(pos.x + w, pos.y + bh)) and not soon
+        self._profile_glyph(dl, icon, pos.x + 34, pos.y + 36, 16,
+                            C(t.text_mute if soon else t.accent_bright)) \
+            if icon in ("hand", "cube") else \
+            icons.draw(icon, dl, pos.x + 34, pos.y + 36, 13,
+                       C(t.text_mute if soon else t.accent_bright))
+        with fonts.use("semi"):
+            dl.add_text(ImVec2(pos.x + 62, pos.y + 22), C(t.text_mute if soon else t.text), title)
+        if soon:
+            with fonts.use("label"):
+                dl.add_text(ImVec2(pos.x + 62, pos.y + 44), C(t.warn), "EM BREVE")
+        imgui.set_cursor_screen_pos(ImVec2(pos.x + 18, pos.y + 66))
+        imgui.push_text_wrap_pos(pos.x + w - 18)
+        imgui.text_colored(t.text_dim, desc)
+        imgui.pop_text_wrap_pos()
+        # clickable surface
+        imgui.set_cursor_screen_pos(pos)
+        if imgui.invisible_button(f"##tile{key}", ImVec2(w, bh)) and not soon:
+            self._open_tool(key)
+        if hov:
+            dl.add_rect(pos, ImVec2(pos.x + w, pos.y + bh),
+                        C(theme.with_alpha(t.accent, 0.8)),
+                        t.rounding, 2.0, 0)  # p_min,p_max,col,rounding,thickness,flags
+        imgui.end_group()
+
+    def _open_tool(self, key):
+        if self.capp is not None:
+            self.capp.go(key)
+        vui.sound.play("click")
+
+    def _runtime_row(self, t, w):
+        s = self.server
+        labels = [m.label + ("" if m.present else "  (baixando)") for m in srv.MODELS]
+        idx = next((i for i, m in enumerate(srv.MODELS) if m.key == self.model_key), 0)
+        new = widgets.combo("", labels, idx, width=w - 150, key="rt_model")
+        if new != idx:
+            self.model_key = srv.MODELS[new].key
+            self.save()
+        imgui.same_line(0, 10)
+        if s.state == "starting":
+            if widgets.button("Cancelar", 130, key="rt_cancel"):
+                s.stop()
+        elif s.ready:
+            if widgets.button("Desligar", 130, key="rt_stop", enabled=not self.agent.busy):
+                s.stop()
+        else:
+            if widgets.button("Ligar modelo", 130, primary=True, key="rt_start",
+                              enabled=srv.model(self.model_key).present and not self.agent.busy):
+                self.server.start(self.model_key, self.ctx)
+        self._status()
+
+    def _status(self):
+        """The status strip the layout places (dense: top bar; tabbed/rail:
+        header). Compact, drawn inline so any layout can host it."""
+        t = theme.current()
+        s = self.server
+        sm = self.sysmon
+        tps = self.agent.last_tps
+        state = ("trabalhando" if self.agent.busy else
+                 "carregando" if s.state == "starting" else
+                 "pronto" if s.ready else "desligado")
+        scol = t.ok if s.ready else (t.warn if s.state == "starting" else t.text_mute)
+        used, cap = self.agent.ctx_used, max(1, s.ctx or self.ctx)
+        imgui.text_colored(scol, state)
+        imgui.same_line(0, 16)
+        imgui.text_colored(t.danger if (tps and tps < 10 and sm.vram_tight) else t.text_dim,
+                           f"{tps:.0f} tok/s" if tps else "-- tok/s")
+        if sm.has_gpu:
+            imgui.same_line(0, 16)
+            imgui.text_colored(t.danger if sm.vram_tight else t.text_dim,
+                               f"VRAM {sm.vram_used:.1f}/{sm.vram_total:.0f}G")
+        imgui.same_line(0, 16)
+        imgui.text_colored(t.text_dim, f"ctx {used // 1000}k/{cap // 1000}k")
+
     def _topbar(self, t):
         dl = imgui.get_window_draw_list()
         w = imgui.get_window_size().x
@@ -233,8 +494,7 @@ class App:
         dl.add_line(ImVec2(o.x, o.y + h), ImVec2(o.x + w, o.y + h),
                     C(theme.with_alpha(t.accent, 0.5)), 1.5)
         self._profile_glyph(dl, prof["icon"], o.x + 27, o.y + h / 2, 11, C(t.accent_bright))
-        name = prof["label"].upper()
-        widgets.caps(dl, o.x + 50, o.y + 13, name, C(t.text), 2.4)
+        widgets.caps(dl, o.x + 50, o.y + 13, prof["label"].upper(), C(t.text), 2.4)
         with fonts.use("label"):
             widgets.caps(dl, o.x + 50, o.y + 33, prof["tag"], C(t.text_dim), 2.6)
 
@@ -247,25 +507,71 @@ class App:
         else:
             word, on = ("PRONTO" if ready else "DESLIGADO"), False
 
-        # right-hand readouts: speed and context fill
-        x = o.x + w - 470
-        with fonts.use("label"):
-            widgets.caps(dl, x, o.y + 12, "VELOCIDADE", C(t.text_mute), 1.6)
-            widgets.caps(dl, x + 120, o.y + 12, "CONTEXTO", C(t.text_mute), 1.6)
+        # right-hand readouts: speed, context fill, VRAM, RAM
+        sm = self.sysmon
         tps = self.agent.last_tps
-        dl.add_text(ImVec2(x, o.y + 27), C(t.text if tps else t.text_mute),
-                    f"{tps:.1f} tok/s" if tps else "--")
         used, cap = self.agent.ctx_used, max(1, s.ctx or self.ctx)
-        frac = min(1.0, used / cap)
-        dl.add_text(ImVec2(x + 120, o.y + 27), C(t.text_dim), f"{used // 1000}k / {cap // 1000}k")
-        cards.meter(dl, x + 120, x + 220, o.y + 46, frac,
-                    t.warn if frac > 0.75 else t.accent, t, h=3.0)
+        cfrac = min(1.0, used / cap)
+        col = 115
+        x = o.x + w - (col * 4 + 130)
+        tight = sm.vram_tight and s.ready
+        with fonts.use("label"):
+            for i, lab in enumerate(("VELOCIDADE", "CONTEXTO", "VRAM", "RAM")):
+                widgets.caps(dl, x + col * i, o.y + 10, lab, C(t.text_mute), 1.5)
+        # speed: red when it has collapsed while VRAM is pinned
+        slow = tps and tps < 10 and tight
+        dl.add_text(ImVec2(x, o.y + 25), C(t.danger if slow else (t.text if tps else t.text_mute)),
+                    f"{tps:.0f} tok/s" if tps else "--")
+        dl.add_text(ImVec2(x + col, o.y + 25), C(t.warn if cfrac > 0.75 else t.text_dim),
+                    f"{used // 1000}k/{cap // 1000}k")
+        cards.meter(dl, x + col, x + col + 95, o.y + 42, cfrac,
+                    t.warn if cfrac > 0.75 else t.accent, t, h=3.0)
+        if sm.has_gpu:
+            dl.add_text(ImVec2(x + col * 2, o.y + 25), C(t.danger if tight else t.text_dim),
+                        f"{sm.vram_used:.1f}/{sm.vram_total:.0f}G")
+            cards.meter(dl, x + col * 2, x + col * 2 + 95, o.y + 42, sm.vram_frac,
+                        t.danger if tight else (t.warn if sm.vram_frac > 0.85 else t.accent), t, h=3.0)
+            dl.add_text(ImVec2(x + col * 3, o.y + 25), C(t.text_dim),
+                        f"{sm.ram_used:.0f}/{sm.ram_total:.0f}G")
+            cards.meter(dl, x + col * 3, x + col * 3 + 95, o.y + 42,
+                        sm.ram_used / max(1.0, sm.ram_total), t.accent, t, h=3.0)
 
-        imgui.set_cursor_screen_pos(ImVec2(o.x + w - 220, o.y + 15))
+        imgui.set_cursor_screen_pos(ImVec2(o.x + w - 200, o.y + 13))
         widgets.status_pill(word, word, on=on, key="srv")
+        # the whole point: name the slowdown when VRAM is pinned
+        if slow:
+            with fonts.use("label"):
+                msg = "VRAM CHEIA — CACHE NA RAM, POR ISSO LENTO. REDUZA O CONTEXTO OU USE O QWEN MoE."
+                tw = widgets.caps_width(msg, 1.4)
+                widgets.caps(dl, o.x + w - tw - 16, o.y + h - 12, msg, C(t.danger), 1.4)
+
         imgui.set_cursor_screen_pos(ImVec2(o.x, o.y + h))
 
     # -- agent tab -------------------------------------------------------
+
+    def _win_begin(self, t, title, w, h, key, right=None, right_col=None):
+        """Frame a region as one of the theme's windows (plate + title bar) and
+        open a transparent scroll child inside it, so the main column reads as
+        panels of the same kind as the sidebar instead of loose content."""
+        dl = imgui.get_window_draw_list()
+        p = imgui.get_cursor_screen_pos()
+        cards.plate(dl, p.x, p.y, w, h, t)
+        if title:
+            cards.card_head(dl, p.x, p.y, w, t, None, title, right, right_col)
+        ip = 10.0
+        top = (cards.HEAD_H if title else ip)
+        imgui.set_cursor_screen_pos(ImVec2(p.x + ip, p.y + top))
+        imgui.push_style_color(imgui.Col_.child_bg, ImVec4(0, 0, 0, 0))
+        imgui.begin_child(key, ImVec2(w - ip * 2, h - top - ip))
+        return p
+
+    def _win_end(self, p, w, h):
+        imgui.end_child()
+        imgui.pop_style_color()
+        # the child only spans the inset; anchor the cursor just below the full
+        # plate so the next item starts there (0-height so no double spacing)
+        imgui.set_cursor_screen_pos(ImVec2(p.x, p.y + h))
+        imgui.dummy(ImVec2(w, 0.0))
 
     def _agent_tab(self, t, pad):
         avail = imgui.get_content_region_avail()
@@ -278,22 +584,30 @@ class App:
         imgui.same_line(0, 14)
         imgui.begin_group()
         main_w = avail.x - SIDE_W - 14 - pad
-        input_h = 96.0
+        input_h = 118.0
         pending = next((i for i in self.agent.items if i.kind == "tool" and i.status == "approve"), None)
         banner = 64.0 if pending else 0.0
-        imgui.begin_child("chat", ImVec2(main_w, h - input_h - banner - 10))
+        chat_h = h - input_h - banner - 16
+        n = sum(1 for i in self.agent.items if i.kind == "tool")
+        right = f"{self.agent.steps} passos" if self.agent.items else None
+        p = self._win_begin(t, "transcrição", main_w, chat_h, "chat", right=right,
+                            right_col=t.text_dim)
         try:
-            self._transcript(t, main_w)
+            self._transcript(t, main_w - 24)
         finally:
-            imgui.end_child()
+            self._win_end(p, main_w, chat_h)
         if pending:
+            imgui.dummy(ImVec2(0, 6))
             self._approval_banner(t, pending, main_w)
+        imgui.dummy(ImVec2(0, 6))
         self._input(t, main_w, input_h)
         imgui.end_group()
 
     def _side(self, t):
         s = self.server
         self._profile_card(t)
+        imgui.dummy(ImVec2(0, 4))
+        self._look_card(t)
         imgui.dummy(ImVec2(0, 4))
         with cards.card("modelo", icon="bolt",
                         right={"ready": "pronto", "external": "externo", "starting": "carregando",
@@ -420,9 +734,10 @@ class App:
                 imgui.pop_id()
             imgui.dummy(ImVec2(0, 4))
         if self.agent.busy:
-            k = int(time.time() * 3) % 4
-            live = self.agent.live_text()
-            imgui.text_colored(t.text_mute, (live or "trabalhando") + " " + "." * k)
+            widgets.spinner(20, key="work_spin", speed=1.2)
+            imgui.same_line(0, 10)
+            imgui.set_cursor_pos_y(imgui.get_cursor_pos_y() + 3)
+            imgui.text_colored(t.text_mute, self.agent.live_text() or "trabalhando")
         imgui.dummy(ImVec2(0, 10))
         if at_bottom or len(items) != self._last_items and self.agent.busy:
             imgui.set_scroll_here_y(1.0)
@@ -589,7 +904,15 @@ class App:
         imgui.set_cursor_screen_pos(ImVec2(p.x, p.y + h + 6))
         imgui.dummy(ImVec2(w, 0))
 
-    def _input(self, t, w, h):
+    def _input(self, t, outer_w, outer_h):
+        # frame the input area as a theme window, like the panels around it
+        dl = imgui.get_window_draw_list()
+        wp = imgui.get_cursor_screen_pos()
+        cards.plate(dl, wp.x, wp.y, outer_w, outer_h, t)
+        ip = 10.0
+        imgui.set_cursor_screen_pos(ImVec2(wp.x + ip, wp.y + ip))
+        w = outer_w - ip * 2
+        field_h = outer_h - ip - 40          # leave a clear row under it (attach + hint)
         bw = 112.0
         if self.focus_prompt:
             imgui.set_keyboard_focus_here()
@@ -598,8 +921,9 @@ class App:
                  | imgui.InputTextFlags_.ctrl_enter_for_new_line)
         imgui.push_style_color(imgui.Col_.frame_bg, t.surface)
         sent, self.prompt = imgui.input_text_multiline(
-            "##prompt", self.prompt, ImVec2(w - bw - 10, h - 22), flags)
+            "##prompt", self.prompt, ImVec2(w - bw - 10, field_h), flags)
         imgui.pop_style_color()
+        h = field_h + 22    # for the button height below, matching the field
         io = imgui.get_io()
         if imgui.is_item_focused() and io.key_ctrl and imgui.is_key_pressed(imgui.Key.v, False):
             self._paste_image()
@@ -613,6 +937,7 @@ class App:
             go = widgets.button("Enviar", bw, height=h - 22, primary=True, key="send",
                                 enabled=ready and bool(self.prompt.strip()))
             if (go or sent) and ready and self.prompt.strip():
+                self.agent.base = self.server.base   # port may have moved
                 self.agent.ctx = self.server.ctx or self.ctx
                 self.agent.vision = self.server.vision
                 self.agent.send(self.prompt.strip(), images=self.attach)
@@ -669,6 +994,323 @@ class App:
 
     # -- other tabs ------------------------------------------------------
 
+    def _audio_tab(self, t, pad):
+        a = self.audio
+        avail = imgui.get_content_region_avail()
+        h = avail.y - 12
+        # left: controls
+        imgui.begin_child("audioside", ImVec2(SIDE_W, h))
+        try:
+            self._audio_side(t, a)
+        finally:
+            imgui.end_child()
+        imgui.same_line(0, 14)
+        imgui.begin_group()
+        main_w = avail.x - SIDE_W - 14 - pad
+        input_h = 104.0
+        var_h = 96.0 if a.vars else 0.0
+        wave_h = h - input_h - var_h - 22 - (10 if a.vars else 0)
+        p = self._win_begin(t, "forma de onda", main_w, wave_h, "wave",
+                            right=(f"{a.duration:.2f}s" if a.audio is not None else None),
+                            right_col=t.text_dim)
+        try:
+            self._audio_wave(t, a, main_w - 24, wave_h - cards.HEAD_H - 20)
+        finally:
+            self._win_end(p, main_w, wave_h)
+        if a.vars:
+            imgui.dummy(ImVec2(0, 6))
+            p = self._win_begin(t, "variações", main_w, var_h, "vars")
+            try:
+                self._audio_vars(t, a, main_w - 24)
+            finally:
+                self._win_end(p, main_w, var_h)
+        imgui.dummy(ImVec2(0, 6))
+        self._audio_input(t, a, main_w, input_h)
+        imgui.end_group()
+
+    BACKENDS = [("procedural", "Procedural (instantâneo)"),
+                ("sfx", "SFX neural (Stable Audio)"),
+                ("music", "Música (Stable Audio)")]
+
+    def _audio_side(self, t, a):
+        with cards.card("motor", icon=None) as c:
+            keys = [k for k, _ in self.BACKENDS]
+            bi = keys.index(a.backend) if a.backend in keys else 0
+            nbi = widgets.combo("", [lbl for _, lbl in self.BACKENDS], bi,
+                                width=c.width, key="aud_backend")
+            a.backend = keys[nbi]
+            if a.backend == "procedural":
+                note("Síntese procedural: instantânea, sem GPU. Cues de UI e SFX curtos.")
+            else:
+                a.neural.refresh_state()
+                if not a.neural.available:
+                    note("Modelo neural indisponível: o venv de IA (torch) não está "
+                         "instalado. Rode build/ai setup.", tone=t.danger)
+                else:
+                    stx = {"off": "desligado", "starting": "iniciando",
+                           "loading": "carregando modelo (~1 min na 1ª vez)",
+                           "ready": "pronto" + (f" · {a.neural.device}" if a.neural.device else ""),
+                           "generating": "gerando...", "error": "erro",
+                           "missing": "indisponível"}.get(a.neural.state, a.neural.state)
+                    tone = (t.danger if a.neural.state in ("error", "missing") else
+                            t.warn if a.neural.state in ("loading", "starting") else t.ok)
+                    imgui.text_colored(tone, "neural: " + stx)
+                    a.seconds = widgets.slider("segundos", a.seconds, 1.0,
+                                               47.0 if a.backend == "music" else 11.0,
+                                               width=c.width - 90, fmt="%.0f", key="aud_secs")
+                    a.steps = int(widgets.slider("passos", float(a.steps), 20, 100,
+                                                 width=c.width - 90, fmt="%.0f", key="aud_steps"))
+        imgui.dummy(ImVec2(0, 4))
+        with cards.card("gerar", icon=None) as c:
+            if a.backend == "procedural":
+                note("Descreva o som: \"soft premium click\", \"glass shatter\". "
+                     "Cada palavra molda o timbre.")
+                roles = audio_mod.ROLES
+                ri = roles.index(a.role) if a.role in roles else 0
+                nri = widgets.combo("papel", roles, ri, width=c.width - 70, key="aud_role")
+                a.role = roles[nri]
+            elif a.backend == "music":
+                note("Descreva a música: \"lo-fi hip hop beat, mellow, rhodes\", "
+                     "\"synthwave, driving bass, 120 bpm\".")
+            else:
+                note("Descreva o efeito: \"heavy metal door slam\", \"laser zap\", "
+                     "\"thunder rumble\". O modelo entende o prompt.")
+            a.seed = imgui.slider_int("seed", a.seed, 0, 999)[1]
+            a.volume = widgets.slider("volume", a.volume, 0.0, 1.0, width=c.width - 70,
+                                      fmt="%.2f", key="aud_vol")
+        imgui.dummy(ImVec2(0, 4))
+        with cards.card("exportar", icon=None) as c:
+            if widgets.button("Salvar WAV", c.width, key="aud_wav",
+                              enabled=a.audio is not None):
+                self._audio_save()
+            note("Salva o som atual como .wav. Geração de música/áudio avançado "
+                 "entra aqui em seguida.")
+        if a.error:
+            imgui.dummy(ImVec2(0, 4))
+            note(a.error, tone=t.danger)
+
+    def _audio_wave(self, t, a, w, h):
+        dl = imgui.get_window_draw_list()
+        p = imgui.get_cursor_screen_pos()
+        mid = p.y + h / 2
+        dl.add_line(ImVec2(p.x, mid), ImVec2(p.x + w, mid),
+                    C(theme.with_alpha(t.border, 0.6)), 1.0)
+        wf = a.waveform(int(max(2, w)))
+        if wf is None:
+            txt = "Gere um som para ver a onda."
+            tw = imgui.calc_text_size(txt).x
+            dl.add_text(ImVec2(p.x + max(8.0, (w - tw) / 2), mid - 9),
+                        C(t.text_dim), txt)
+            imgui.dummy(ImVec2(w, h))
+            return
+        amp = h / 2 * 0.92
+        step = w / max(1, len(wf))
+        for i, v in enumerate(wf):
+            x = p.x + i * step
+            dl.add_line(ImVec2(x, mid - v * amp), ImVec2(x, mid + v * amp),
+                        C(theme.with_alpha(t.accent, 0.85)), max(1.0, step))
+        imgui.dummy(ImVec2(w, h))
+
+    def _audio_vars(self, t, a, w):
+        cols = len(a.vars)
+        bw = (w - (cols - 1) * 8) / max(1, cols)
+        for i, r in enumerate(a.vars):
+            if i:
+                imgui.same_line(0, 8)
+            active = a.recipe is r
+            if widgets.button(getattr(r, "name", str(i + 1))[:14], bw, height=40,
+                              primary=active, key=f"var{i}"):
+                a.pick_variation(i)
+
+    def _audio_input(self, t, a, outer_w, outer_h):
+        dl = imgui.get_window_draw_list()
+        wp = imgui.get_cursor_screen_pos()
+        cards.plate(dl, wp.x, wp.y, outer_w, outer_h, t)
+        ip = 10.0
+        imgui.set_cursor_screen_pos(ImVec2(wp.x + ip, wp.y + ip))
+        w = outer_w - ip * 2
+        field_h = outer_h - ip * 2 - 22
+        bw = 108.0
+        if self.audio_focus:
+            imgui.set_keyboard_focus_here()
+            self.audio_focus = False
+        flags = imgui.InputTextFlags_.enter_returns_true
+        imgui.push_style_color(imgui.Col_.frame_bg, t.surface)
+        sent, a.prompt = imgui.input_text_multiline("##audprompt", a.prompt,
+                                                    ImVec2(w - bw - 10, field_h), flags)
+        imgui.pop_style_color()
+        imgui.same_line(0, 10)
+        imgui.begin_group()
+        if a.busy:
+            widgets.spinner(20, key="aud_spin")
+        else:
+            proc = a.backend == "procedural"
+            gh = (field_h / 2 - 3) if proc else field_h
+            if (widgets.button("Gerar", bw, height=gh, primary=True,
+                               key="aud_gen", enabled=bool(a.prompt.strip())) or sent) \
+                    and a.prompt.strip():
+                a.generate()
+                self.audio_focus = True
+            if proc and widgets.button("Variações", bw, height=field_h / 2 - 3, key="aud_var",
+                                       enabled=bool(a.prompt.strip())):
+                a.variations()
+        imgui.end_group()
+        imgui.text_colored(t.text_mute, "Enter gera · o som toca sozinho · "
+                           "Variações dá 6 opções para escolher")
+
+    def _audio_save(self):
+        try:
+            from imgui_bundle import portable_file_dialogs as pfd
+            default = (self.audio.recipe.name if self.audio.recipe else "som") + ".wav"
+            r = pfd.save_file("Salvar WAV", default, ["WAV", "*.wav"]).result()
+        except Exception:
+            r = ""
+        if r:
+            self.audio.error = self.audio.export_wav(r)
+
+    # -- image tool ------------------------------------------------------
+
+    def _image_tab(self, t, pad):
+        im = self.image
+        avail = imgui.get_content_region_avail()
+        h = avail.y - 12
+        imgui.begin_child("imgside", ImVec2(SIDE_W, h))
+        try:
+            self._image_side(t, im)
+        finally:
+            imgui.end_child()
+        imgui.same_line(0, 14)
+        imgui.begin_group()
+        main_w = avail.x - SIDE_W - 14 - pad
+        input_h = 104.0
+        prev_h = h - input_h - 16
+        right = None
+        if im.last_path is not None and im.image is not None:
+            right = f"{im.image.width}x{im.image.height}"
+        p = self._win_begin(t, "imagem", main_w, prev_h, "wave",
+                            right=right, right_col=t.text_dim)
+        try:
+            self._image_preview(t, im, main_w - 24, prev_h - cards.HEAD_H - 20)
+        finally:
+            self._win_end(p, main_w, prev_h)
+        imgui.dummy(ImVec2(0, 6))
+        self._image_input(t, im, main_w, input_h)
+        imgui.end_group()
+
+    def _image_side(self, t, im):
+        with cards.card("modelo", icon=None) as c:
+            keys = [k for k, _ in image_mod.MODELS]
+            mi = keys.index(im.model) if im.model in keys else 0
+            nmi = widgets.combo("", [lbl for _, lbl in image_mod.MODELS], mi,
+                                width=c.width, key="img_model")
+            if keys[nmi] != im.model:
+                im.set_model(keys[nmi])
+            im.server.refresh_state()
+            if not im.server.available:
+                note("Modelo indisponível: o venv de IA (torch) não está instalado. "
+                     "Rode: python -m lcoder.neural_setup", tone=t.danger)
+            else:
+                stx = {"off": "desligado", "starting": "iniciando",
+                       "loading": "carregando modelo (1ª vez baixa os pesos)",
+                       "ready": "pronto" + (f" · {im.server.device}" if im.server.device else ""),
+                       "generating": "renderizando...", "error": "erro",
+                       "missing": "indisponível"}.get(im.server.state, im.server.state)
+                tone = (t.danger if im.server.state in ("error", "missing") else
+                        t.warn if im.server.state in ("loading", "starting") else t.ok)
+                imgui.text_colored(tone, "gpu: " + stx)
+        imgui.dummy(ImVec2(0, 4))
+        with cards.card("parâmetros", icon=None) as c:
+            im.steps = int(widgets.slider("passos", float(im.steps), 1, 60,
+                                          width=c.width - 90, fmt="%.0f", key="img_steps"))
+            im.guidance = widgets.slider("guidance", im.guidance, 0.0, 15.0,
+                                         width=c.width - 90, fmt="%.1f", key="img_guid")
+            sizes = [512, 768, 1024]
+            si = sizes.index(im.size) if im.size in sizes else len(sizes) - 1
+            nsi = widgets.combo("tamanho", [f"{s}px" for s in sizes], si,
+                                width=c.width - 90, key="img_size")
+            im.size = sizes[nsi]
+            im.seed = imgui.slider_int("seed", im.seed, 0, 999999)[1]
+            note("seed 0 = aleatório a cada geração. SDXL rende em 1024; turbo "
+                 "usa poucos passos e guidance 0.")
+        imgui.dummy(ImVec2(0, 4))
+        with cards.card("exportar", icon=None) as c:
+            if widgets.button("Salvar PNG", c.width, key="img_png",
+                              enabled=im.last_path is not None):
+                self._image_save()
+            note("As imagens também ficam em output/images/ automaticamente.")
+        if im.error:
+            imgui.dummy(ImVec2(0, 4))
+            note(im.error, tone=t.danger)
+
+    def _image_preview(self, t, im, w, h):
+        dl = imgui.get_window_draw_list()
+        p = imgui.get_cursor_screen_pos()
+        if im.last_path is None:
+            txt = "Descreva uma imagem e gere."
+            tw = imgui.calc_text_size(txt).x
+            dl.add_text(ImVec2(p.x + max(8.0, (w - tw) / 2), p.y + h / 2 - 9),
+                        C(t.text_dim), txt)
+            imgui.dummy(ImVec2(w, h))
+            return
+        tex = self._avatar_tex(str(im.last_path))
+        if not tex or not tex[1]:
+            imgui.dummy(ImVec2(w, h))
+            return
+        tid, iw, ih = tex
+        scale = min(w / iw, h / ih)
+        dw, dh = iw * scale, ih * scale
+        ox, oy = p.x + (w - dw) / 2, p.y + (h - dh) / 2
+        dl.add_image(imgui.ImTextureRef(int(tid)), ImVec2(ox, oy),
+                     ImVec2(ox + dw, oy + dh))
+        imgui.dummy(ImVec2(w, h))
+
+    def _image_input(self, t, im, outer_w, outer_h):
+        dl = imgui.get_window_draw_list()
+        wp = imgui.get_cursor_screen_pos()
+        cards.plate(dl, wp.x, wp.y, outer_w, outer_h, t)
+        ip = 10.0
+        imgui.set_cursor_screen_pos(ImVec2(wp.x + ip, wp.y + ip))
+        w = outer_w - ip * 2
+        field_h = outer_h - ip * 2 - 22
+        bw = 108.0
+        if self.image_focus:
+            imgui.set_keyboard_focus_here()
+            self.image_focus = False
+        flags = imgui.InputTextFlags_.enter_returns_true
+        imgui.push_style_color(imgui.Col_.frame_bg, t.surface)
+        sent, im.prompt = imgui.input_text_multiline("##imgprompt", im.prompt,
+                                                     ImVec2(w - bw - 10, field_h), flags)
+        imgui.pop_style_color()
+        imgui.same_line(0, 10)
+        imgui.begin_group()
+        if im.busy:
+            widgets.spinner(20, key="img_spin")
+        else:
+            if (widgets.button("Gerar", bw, height=field_h, primary=True,
+                               key="img_gen", enabled=bool(im.prompt.strip())) or sent) \
+                    and im.prompt.strip():
+                im.generate()
+                self.image_focus = True
+        imgui.end_group()
+        imgui.text_colored(t.text_mute, "Enter gera · a 1ª geração baixa/carrega o "
+                           "modelo (pode levar minutos) · salva em output/images/")
+
+    def _image_save(self):
+        if self.image.last_path is None:
+            return
+        try:
+            from imgui_bundle import portable_file_dialogs as pfd
+            r = pfd.save_file("Salvar PNG", "imagem.png", ["PNG", "*.png"]).result()
+        except Exception:
+            r = ""
+        if r:
+            try:
+                import shutil
+                shutil.copyfile(self.image.last_path, r)
+                self.image.error = f"salvo: {r}"
+            except Exception as e:
+                self.image.error = f"salvar: {e}"
+
     def _server_tab(self, t, pad):
         s = self.server
         imgui.text_colored(t.text_dim, f"{s.base}  ·  estado: {s.state}  ·  modelo: {s.model_key or '-'}"
@@ -679,8 +1321,7 @@ class App:
     def _settings_tab(self, t, pad):
         imgui.begin_child("settings", ImVec2(0, imgui.get_content_region_avail().y - 12))
         try:
-            secs = [x for x in settings.SECTIONS if x not in ("backdrop", "effects")]
-            settings.panel(self.st, self.log, sections=secs,
+            settings.panel(self.st, self.log, backdrop=self.bg, effects=self.fx,
                            on_change=lambda _s: (self.save(), self._apply_accent()))
         finally:
             imgui.end_child()
@@ -689,7 +1330,36 @@ class App:
         self.agent.stop()
         self.agent.box.stop_all()
         self.server.stop()
+        self.sysmon.stop()
+        self.audio.neural.stop()
+        self.image.stop()
         self.save()
+
+
+class Shell(compose.Module):
+    """Wires Local Coder's existing views into the compose architecture, so the
+    profile's LAYOUT (tabs / rail / dense / windows) decides the app's shape -
+    a genuinely different UI per theme, not a reskin. The state and all the
+    drawing live on `App`; this just registers them as pages and slots."""
+    name = "coder"
+
+    def __init__(self, state: "App"):
+        self.state = state
+
+    def setup(self, app):
+        self.state.capp = app
+        s = self.state
+        p = lambda fn: (lambda a: fn(theme.current(), 16.0))
+        app.page("home", "Hub", icon="bolt", draw=p(s._home_page), order=-1)
+        app.page("agent", "Agente", icon="bolt", draw=p(s._agent_tab), order=0)
+        app.page("audio", "Áudio", icon="play", draw=p(s._audio_tab), order=1)
+        app.page("image", "Imagem", icon="dot", draw=p(s._image_tab), order=2)
+        app.page("server", "Servidor", icon="gear", draw=p(s._server_tab), order=3)
+        app.page("settings", "Ajustes", icon="gear", draw=p(s._settings_tab), order=4)
+        app.slot("status", lambda a: s._status())
+
+    def frame(self, app):
+        self.state.pump_log()
 
 
 def run():
@@ -697,14 +1367,9 @@ def run():
     if not st.extras.get("inited"):
         st.theme_name = "noir-blue"
         st.extras["inited"] = True
-    params = hello_imgui.RunnerParams()
-    params.app_window_params.window_title = "Local Coder"
-    params.app_window_params.window_geometry.size = (1320, 880)
-    params.imgui_window_params.default_imgui_window_type = (
-        hello_imgui.DefaultImGuiWindowType.provide_full_screen_window)
-    params.imgui_window_params.show_menu_bar = False
     app = App(st)
-    params.callbacks.show_gui = app.frame
-    params.callbacks.before_exit = app.shutdown
-    vui.install(params, theme_=st.build_theme(), faces=st.build_faces())
-    hello_imgui.run(params)
+    capp = compose.App(profile=profiles.get(app.look), title="LOCAL CODER",
+                       app_id="localcoder", size=(1320, 880))
+    capp.use(Shell(app))
+    capp.run()
+    app.shutdown()

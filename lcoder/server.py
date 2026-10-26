@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import subprocess
 import threading
 import time
@@ -31,6 +32,9 @@ class Model:
     note: str
     mmproj: str = ""       # vision projector; without it the model is text-only
     mtp: bool = False      # carries multi-token-prediction heads
+    moe: bool = True       # MoE (expert offload) vs dense (per-layer offload)
+    bytes_: int = 0        # expected complete size, to tell a finished file from a partial one
+    ctx: int = 65536       # preferred context for this model
 
     @property
     def path(self) -> Path:
@@ -39,9 +43,12 @@ class Model:
     @property
     def present(self) -> bool:
         p = self.path
-        # a file still downloading is present but useless; GGUF this size
-        # is never under 15 GB when complete
-        return p.exists() and p.stat().st_size > 15e9
+        if not p.exists():
+            return False
+        # a file still downloading looks present but is useless; accept only a
+        # file within 1% of the known complete size (or >13 GB if unknown)
+        n = p.stat().st_size
+        return n >= self.bytes_ * 0.99 if self.bytes_ else n > 13e9
 
     @property
     def vision(self) -> bool:
@@ -53,11 +60,11 @@ MODELS = [
     Model("normal", "Qwen3.6 35B-A3B",
           "Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf",
           "Melhor qualidade. Recusa raramente em código.",
-          mmproj="mmproj-qwen3.6-F16.gguf"),
+          mmproj="mmproj-qwen3.6-F16.gguf", bytes_=22360456160),
     Model("abliterated", "Qwen3.6 35B-A3B abliterated",
           "Huihui-Qwen3.6-35B-A3B-abliterated-Q4_K.gguf",
           "Sem recusas. Um pouco menos preciso.",
-          mmproj="mmproj-huihui-abliterated-f16.gguf", mtp=True),
+          mmproj="mmproj-huihui-abliterated-f16.gguf", mtp=True, bytes_=21712409824),
 ]
 
 
@@ -66,6 +73,35 @@ def model(key: str) -> Model:
         if m.key == key:
             return m
     return MODELS[0]
+
+
+def _bindable(port: int) -> bool:
+    """True if we can actually bind 127.0.0.1:port right now. Catches both a
+    port in use AND a Windows *reserved* port range (Hyper-V/WSL grab ranges,
+    after which the OS refuses the bind and the real cause is invisible)."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 0)
+        s.bind(("127.0.0.1", port))
+        return True
+    except OSError:
+        return False
+    finally:
+        s.close()
+
+
+def _free_port(preferred: int) -> int:
+    """The preferred port if usable, else the next usable one, else an
+    OS-assigned ephemeral port."""
+    for p in [preferred] + [preferred + i for i in range(1, 40)]:
+        if _bindable(p):
+            return p
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+    finally:
+        s.close()
 
 
 class Server:
@@ -141,6 +177,13 @@ class Server:
         if not m.present:
             self.state, self.error = "error", f"modelo ausente ou incompleto: {m.file}"
             return
+        # the saved port may now be in a Windows reserved range (nothing binds
+        # it, the server would just exit "couldn't bind"); move to a free one
+        if not _bindable(self.port):
+            new = _free_port(self.port + 1)
+            self._push(f"[local coder] porta {self.port} indisponível (reservada/ocupada); usando {new}")
+            self.port = new
+            self.base = f"http://127.0.0.1:{self.port}"
         args = [str(exe), "-m", str(m.path),
                 "--host", "127.0.0.1", "--port", str(self.port),
                 "-c", str(ctx),
@@ -154,13 +197,13 @@ class Server:
                 "-a", m.key,
                 "-np", "1",          # one agent, one slot: no idle KV/compute buffers
                 "-t", str(max(1, (os.cpu_count() or 12) // 2))]
-        if ncmoe > 0:
+        if m.moe and ncmoe > 0:
             args += ["-ngl", "99", "-ncmoe", str(ncmoe), "--fit", "off"]
         else:
-            # --fit picks how many expert layers stay on the CPU so the rest
-            # fills the GPU without spilling into shared memory
+            # dense models have no experts to offload; --fit sizes -ngl to fit
+            # the GPU. (Also the fallback path when the fixed split overflows.)
             args += ["--fit-target", "768"]
-        self._fallback = (model_key, ctx, mtp) if ncmoe > 0 else None
+        self._fallback = (model_key, ctx, mtp) if (m.moe and ncmoe > 0) else None
         if m.vision:
             args += ["--mmproj", str(MODELS_DIR / m.mmproj)]
         else:

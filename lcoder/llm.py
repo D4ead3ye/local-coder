@@ -20,14 +20,15 @@ class Cancelled(Exception):
 
 
 def stream_chat(base: str, messages, tools, on_delta, cancel, model="local",
-                max_tokens=16384):
+                max_tokens=16384, sampling=None):
     """`on_delta(kind, text)` with kind in {"text", "think", "tool", "tool_name"}.
     `cancel` is a threading.Event; setting it aborts the read.
 
-    Returns (message, stats) where stats has prompt/predicted token counts
-    and generation speed when the server reports them."""
+    `sampling` overrides the default coding sampling when a caller wants more
+    variety. Returns (message, stats) where stats has prompt/predicted token
+    counts and generation speed when the server reports them."""
     body = {"model": model, "messages": messages, "stream": True,
-            "max_tokens": max_tokens, **SAMPLING}
+            "max_tokens": max_tokens, **(sampling or SAMPLING)}
     if tools:
         body["tools"] = tools
     req = urllib.request.Request(
