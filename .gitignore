@@ -23,6 +23,9 @@ __pycache__/
 *.pyo
 .mypy_cache/
 
+# ImGui runtime layout (per-user)
+imgui.ini
+
 # OS / editor
 Thumbs.db
 desktop.ini
