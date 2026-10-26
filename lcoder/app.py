@@ -26,10 +26,11 @@ from vertexui import (theme, widgets, cards, icons, logview, fonts, settings, an
 from . import server as srv
 from . import prompt
 from . import sysmon as sysmon_mod
+from . import audio as audio_mod
 from . import rp as rp_mod
 from .agent import Agent, Item, MODES, MODE_LABELS
 
-TABS = ["Agente", "Servidor", "Ajustes"]
+TABS = ["Agente", "Áudio", "Servidor", "Ajustes"]
 CTX_OPTIONS = [32768, 65536, 98304, 131072]
 DEFAULT_WS = srv.ROOT / "workspace"
 SIDE_W = 300.0
@@ -162,6 +163,8 @@ class App:
         self._fade = 0.0
         self._tex: dict = {}                 # avatar path -> (texid, w, h) or None
         self.sysmon = sysmon_mod.SysMon()    # background VRAM/RAM sampler
+        self.audio = audio_mod.AudioTool()
+        self.audio_focus = False
 
         if not self.server.adopt_existing() and srv.model(self.model_key).present:
             self.server.start(self.model_key, self.ctx)
@@ -226,7 +229,8 @@ class App:
         else:
             self.tab = widgets.tabs("nav", TABS, self.tab)
             imgui.dummy(ImVec2(0, 6))
-            [self._agent_tab, self._server_tab, self._settings_tab][self.tab](t, pad)
+            [self._agent_tab, self._audio_tab, self._server_tab,
+             self._settings_tab][self.tab](t, pad)
         imgui.unindent(pad)
 
         # 3) particles again over the top, drifting across the panels.
@@ -1386,6 +1390,139 @@ class App:
         elif self.rp.card is None:
             hint = "Escolha um personagem à esquerda."
         imgui.text_colored(t.text_mute, hint)
+
+    def _audio_tab(self, t, pad):
+        a = self.audio
+        avail = imgui.get_content_region_avail()
+        h = avail.y - 12
+        # left: controls
+        imgui.begin_child("audioside", ImVec2(SIDE_W, h))
+        try:
+            self._audio_side(t, a)
+        finally:
+            imgui.end_child()
+        imgui.same_line(0, 14)
+        imgui.begin_group()
+        main_w = avail.x - SIDE_W - 14 - pad
+        input_h = 104.0
+        var_h = 96.0 if a.vars else 0.0
+        wave_h = h - input_h - var_h - 22 - (10 if a.vars else 0)
+        p = self._win_begin(t, "forma de onda", main_w, wave_h, "wave",
+                            right=(f"{a.duration:.2f}s" if a.audio is not None else None),
+                            right_col=t.text_dim)
+        try:
+            self._audio_wave(t, a, main_w - 24, wave_h - cards.HEAD_H - 20)
+        finally:
+            self._win_end(p, main_w, wave_h)
+        if a.vars:
+            imgui.dummy(ImVec2(0, 6))
+            p = self._win_begin(t, "variações", main_w, var_h, "vars")
+            try:
+                self._audio_vars(t, a, main_w - 24)
+            finally:
+                self._win_end(p, main_w, var_h)
+        imgui.dummy(ImVec2(0, 6))
+        self._audio_input(t, a, main_w, input_h)
+        imgui.end_group()
+
+    def _audio_side(self, t, a):
+        with cards.card("gerar", icon=None) as c:
+            note("Descreva o som: \"soft premium click\", \"glass shatter\", "
+                 "\"deep sci-fi hum\". Cada palavra molda o timbre.")
+            roles = audio_mod.ROLES
+            ri = roles.index(a.role) if a.role in roles else 0
+            nri = widgets.combo("papel", roles, ri, width=c.width - 70, key="aud_role")
+            a.role = roles[nri]
+            a.seed = imgui.slider_int("seed", a.seed, 0, 999)[1]
+            a.volume = widgets.slider("volume", a.volume, 0.0, 1.0, width=c.width - 70,
+                                      fmt="%.2f", key="aud_vol")
+        imgui.dummy(ImVec2(0, 4))
+        with cards.card("exportar", icon=None) as c:
+            if widgets.button("Salvar WAV", c.width, key="aud_wav",
+                              enabled=a.audio is not None):
+                self._audio_save()
+            note("Salva o som atual como .wav. Geração de música/áudio avançado "
+                 "entra aqui em seguida.")
+        if a.error:
+            imgui.dummy(ImVec2(0, 4))
+            note(a.error, tone=t.danger)
+
+    def _audio_wave(self, t, a, w, h):
+        dl = imgui.get_window_draw_list()
+        p = imgui.get_cursor_screen_pos()
+        mid = p.y + h / 2
+        dl.add_line(ImVec2(p.x, mid), ImVec2(p.x + w, mid),
+                    C(theme.with_alpha(t.border, 0.6)), 1.0)
+        wf = a.waveform(int(max(2, w)))
+        if wf is None:
+            with fonts.use("title"):
+                imgui.text_colored(t.text_dim, "")
+            imgui.set_cursor_screen_pos(ImVec2(p.x + 8, mid - 10))
+            imgui.text_colored(t.text_dim, "Gere um som para ver a onda.")
+            imgui.dummy(ImVec2(w, h))
+            return
+        amp = h / 2 * 0.92
+        step = w / max(1, len(wf))
+        for i, v in enumerate(wf):
+            x = p.x + i * step
+            dl.add_line(ImVec2(x, mid - v * amp), ImVec2(x, mid + v * amp),
+                        C(theme.with_alpha(t.accent, 0.85)), max(1.0, step))
+        imgui.dummy(ImVec2(w, h))
+
+    def _audio_vars(self, t, a, w):
+        cols = len(a.vars)
+        bw = (w - (cols - 1) * 8) / max(1, cols)
+        for i, r in enumerate(a.vars):
+            if i:
+                imgui.same_line(0, 8)
+            active = a.recipe is r
+            if widgets.button(getattr(r, "name", str(i + 1))[:14], bw, height=40,
+                              primary=active, key=f"var{i}"):
+                a.pick_variation(i)
+
+    def _audio_input(self, t, a, outer_w, outer_h):
+        dl = imgui.get_window_draw_list()
+        wp = imgui.get_cursor_screen_pos()
+        cards.plate(dl, wp.x, wp.y, outer_w, outer_h, t)
+        ip = 10.0
+        imgui.set_cursor_screen_pos(ImVec2(wp.x + ip, wp.y + ip))
+        w = outer_w - ip * 2
+        field_h = outer_h - ip * 2 - 22
+        bw = 108.0
+        if self.audio_focus:
+            imgui.set_keyboard_focus_here()
+            self.audio_focus = False
+        flags = imgui.InputTextFlags_.enter_returns_true
+        imgui.push_style_color(imgui.Col_.frame_bg, t.surface)
+        sent, a.prompt = imgui.input_text_multiline("##audprompt", a.prompt,
+                                                    ImVec2(w - bw - 10, field_h), flags)
+        imgui.pop_style_color()
+        imgui.same_line(0, 10)
+        imgui.begin_group()
+        if a.busy:
+            widgets.spinner(20, key="aud_spin")
+        else:
+            if (widgets.button("Gerar", bw, height=field_h / 2 - 3, primary=True,
+                               key="aud_gen", enabled=bool(a.prompt.strip())) or sent) \
+                    and a.prompt.strip():
+                a.generate()
+                self.audio_focus = True
+            if widgets.button("Variações", bw, height=field_h / 2 - 3, key="aud_var",
+                              enabled=bool(a.prompt.strip())):
+                a.variations()
+        imgui.end_group()
+        imgui.text_colored(t.text_mute, "Enter gera · o som toca sozinho · "
+                           "Variações dá 6 opções para escolher")
+
+    def _audio_save(self):
+        try:
+            from imgui_bundle import portable_file_dialogs as pfd
+            default = (self.audio.recipe.name if self.audio.recipe else "som") + ".wav"
+            r = pfd.save_file("Salvar WAV", default, ["WAV", "*.wav"]).result()
+        except Exception:
+            r = ""
+        if r:
+            self.audio.error = self.audio.export_wav(r)
 
     def _server_tab(self, t, pad):
         s = self.server
