@@ -81,6 +81,12 @@ class NeuralAudio:
     def available(self) -> bool:
         return AI_VENV_PY.exists()
 
+    def provision(self, log=print) -> bool:
+        """Create/complete the neural CUDA venv (large download). Blocking;
+        the UI calls this on a worker thread."""
+        from . import neural_setup
+        return neural_setup.provision(log=log)
+
     def _get(self, path, timeout=2):
         with urllib.request.urlopen(self.base + path, timeout=timeout) as r:
             return json.loads(r.read())
@@ -89,7 +95,8 @@ class NeuralAudio:
         """Start the server if it is not up. Returns False if the venv is
         missing (neural generation unavailable)."""
         if not self.available:
-            self.state, self.error = "missing", "ai-venv ausente (torch não instalado)"
+            self.state = "missing"
+            self.error = "ai-venv ausente — rode: python -m lcoder.neural_setup"
             return False
         if self.proc and self.proc.poll() is None:
             return True

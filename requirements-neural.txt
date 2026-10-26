@@ -1,0 +1,23 @@
+# Neural audio/image venv (ai-venv) — a SEPARATE CUDA environment from the app.
+#
+# The main app's Python stays torch-free; this venv holds the heavy GPU stack
+# and runs neural_server.py, which the app drives over HTTP (like llama-server).
+# Provision it with the bundled helper (creates ai-venv/ and installs this):
+#
+#   python -m lcoder.neural_setup
+#
+# or by hand:
+#   python -m venv ai-venv
+#   ai-venv\Scripts\python -m pip install torch --index-url https://download.pytorch.org/whl/cu130
+#   ai-venv\Scripts\python -m pip install -r requirements-neural.txt
+#
+# torch is installed FIRST from the CUDA index above (not pinned here, so the
+# wheel matches the local CUDA/driver). Validated set on an RTX 5070:
+#   torch 2.14.1+cu130, python 3.14
+
+diffusers>=0.42
+transformers>=5.20
+accelerate>=1.15
+soundfile>=0.14
+torchsde>=0.2.6   # Stable Audio's CosineDPMSolver scheduler needs this
+numpy>=2.0
