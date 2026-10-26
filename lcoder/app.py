@@ -452,7 +452,8 @@ class App:
             self._open_tool(key)
         if hov:
             dl.add_rect(pos, ImVec2(pos.x + w, pos.y + bh),
-                        C(theme.with_alpha(t.accent, 0.8)), t.rounding, 0, 2.0)
+                        C(theme.with_alpha(t.accent, 0.8)),
+                        t.rounding, 2.0, 0)  # p_min,p_max,col,rounding,thickness,flags
         imgui.end_group()
 
     def _open_tool(self, key):
