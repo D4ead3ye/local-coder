@@ -572,7 +572,7 @@ class App:
         imgui.same_line(0, 14)
         imgui.begin_group()
         main_w = avail.x - SIDE_W - 14 - pad
-        input_h = 104.0
+        input_h = 118.0
         pending = next((i for i in self.agent.items if i.kind == "tool" and i.status == "approve"), None)
         banner = 64.0 if pending else 0.0
         chat_h = h - input_h - banner - 16
@@ -911,7 +911,7 @@ class App:
         ip = 10.0
         imgui.set_cursor_screen_pos(ImVec2(wp.x + ip, wp.y + ip))
         w = outer_w - ip * 2
-        field_h = outer_h - ip * 2 - 22      # room under it for the attach row
+        field_h = outer_h - ip - 40          # leave a clear row under it (attach + hint)
         bw = 112.0
         if self.focus_prompt:
             imgui.set_keyboard_focus_here()
@@ -1503,10 +1503,10 @@ class App:
                     C(theme.with_alpha(t.border, 0.6)), 1.0)
         wf = a.waveform(int(max(2, w)))
         if wf is None:
-            with fonts.use("title"):
-                imgui.text_colored(t.text_dim, "")
-            imgui.set_cursor_screen_pos(ImVec2(p.x + 8, mid - 10))
-            imgui.text_colored(t.text_dim, "Gere um som para ver a onda.")
+            txt = "Gere um som para ver a onda."
+            tw = imgui.calc_text_size(txt).x
+            dl.add_text(ImVec2(p.x + max(8.0, (w - tw) / 2), mid - 9),
+                        C(t.text_dim), txt)
             imgui.dummy(ImVec2(w, h))
             return
         amp = h / 2 * 0.92
