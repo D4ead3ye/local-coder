@@ -1560,14 +1560,53 @@ class App:
         self._audio_input(t, a, main_w, input_h)
         imgui.end_group()
 
+    BACKENDS = [("procedural", "Procedural (instantâneo)"),
+                ("sfx", "SFX neural (Stable Audio)"),
+                ("music", "Música (Stable Audio)")]
+
     def _audio_side(self, t, a):
+        with cards.card("motor", icon=None) as c:
+            keys = [k for k, _ in self.BACKENDS]
+            bi = keys.index(a.backend) if a.backend in keys else 0
+            nbi = widgets.combo("", [lbl for _, lbl in self.BACKENDS], bi,
+                                width=c.width, key="aud_backend")
+            a.backend = keys[nbi]
+            if a.backend == "procedural":
+                note("Síntese procedural: instantânea, sem GPU. Cues de UI e SFX curtos.")
+            else:
+                a.neural.refresh_state()
+                if not a.neural.available:
+                    note("Modelo neural indisponível: o venv de IA (torch) não está "
+                         "instalado. Rode build/ai setup.", tone=t.danger)
+                else:
+                    stx = {"off": "desligado", "starting": "iniciando",
+                           "loading": "carregando modelo (~1 min na 1ª vez)",
+                           "ready": "pronto" + (f" · {a.neural.device}" if a.neural.device else ""),
+                           "generating": "gerando...", "error": "erro",
+                           "missing": "indisponível"}.get(a.neural.state, a.neural.state)
+                    tone = (t.danger if a.neural.state in ("error", "missing") else
+                            t.warn if a.neural.state in ("loading", "starting") else t.ok)
+                    imgui.text_colored(tone, "neural: " + stx)
+                    a.seconds = widgets.slider("segundos", a.seconds, 1.0,
+                                               47.0 if a.backend == "music" else 11.0,
+                                               width=c.width - 90, fmt="%.0f", key="aud_secs")
+                    a.steps = int(widgets.slider("passos", float(a.steps), 20, 100,
+                                                 width=c.width - 90, fmt="%.0f", key="aud_steps"))
+        imgui.dummy(ImVec2(0, 4))
         with cards.card("gerar", icon=None) as c:
-            note("Descreva o som: \"soft premium click\", \"glass shatter\", "
-                 "\"deep sci-fi hum\". Cada palavra molda o timbre.")
-            roles = audio_mod.ROLES
-            ri = roles.index(a.role) if a.role in roles else 0
-            nri = widgets.combo("papel", roles, ri, width=c.width - 70, key="aud_role")
-            a.role = roles[nri]
+            if a.backend == "procedural":
+                note("Descreva o som: \"soft premium click\", \"glass shatter\". "
+                     "Cada palavra molda o timbre.")
+                roles = audio_mod.ROLES
+                ri = roles.index(a.role) if a.role in roles else 0
+                nri = widgets.combo("papel", roles, ri, width=c.width - 70, key="aud_role")
+                a.role = roles[nri]
+            elif a.backend == "music":
+                note("Descreva a música: \"lo-fi hip hop beat, mellow, rhodes\", "
+                     "\"synthwave, driving bass, 120 bpm\".")
+            else:
+                note("Descreva o efeito: \"heavy metal door slam\", \"laser zap\", "
+                     "\"thunder rumble\". O modelo entende o prompt.")
             a.seed = imgui.slider_int("seed", a.seed, 0, 999)[1]
             a.volume = widgets.slider("volume", a.volume, 0.0, 1.0, width=c.width - 70,
                                       fmt="%.2f", key="aud_vol")
@@ -1637,13 +1676,15 @@ class App:
         if a.busy:
             widgets.spinner(20, key="aud_spin")
         else:
-            if (widgets.button("Gerar", bw, height=field_h / 2 - 3, primary=True,
+            proc = a.backend == "procedural"
+            gh = (field_h / 2 - 3) if proc else field_h
+            if (widgets.button("Gerar", bw, height=gh, primary=True,
                                key="aud_gen", enabled=bool(a.prompt.strip())) or sent) \
                     and a.prompt.strip():
                 a.generate()
                 self.audio_focus = True
-            if widgets.button("Variações", bw, height=field_h / 2 - 3, key="aud_var",
-                              enabled=bool(a.prompt.strip())):
+            if proc and widgets.button("Variações", bw, height=field_h / 2 - 3, key="aud_var",
+                                       enabled=bool(a.prompt.strip())):
                 a.variations()
         imgui.end_group()
         imgui.text_colored(t.text_mute, "Enter gera · o som toca sozinho · "
@@ -1679,6 +1720,7 @@ class App:
         self.agent.box.stop_all()
         self.server.stop()
         self.sysmon.stop()
+        self.audio.neural.stop()
         self.save()
 
 
