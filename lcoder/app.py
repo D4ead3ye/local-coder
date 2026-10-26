@@ -21,7 +21,7 @@ from imgui_bundle import hello_imgui, imgui, ImVec2, ImVec4
 
 import vertexui as vui
 from vertexui import (theme, widgets, cards, icons, logview, fonts, settings, anim,
-                      effects as fx_mod, backdrop as bg_mod)
+                      effects as fx_mod, backdrop as bg_mod, compose, profiles)
 
 from . import server as srv
 from . import prompt
@@ -112,6 +112,7 @@ class App:
         self.mode = ex.get("mode", "auto")
         self.profile = ex.get("profile", prompt.DEFAULT_PROFILE)
         self.look = ex.get("look", "noir")   # VertexUI visual profile (identity)
+        self.capp = None                     # the compose.App, set by Shell.setup
         self.look_plain = True
         self.ws = ex.get("workspace", str(DEFAULT_WS))
         self.tab = 0
@@ -289,6 +290,9 @@ class App:
         if name == self.look:
             return
         self.look = name
+        if self.capp is not None:
+            # swap the whole identity AND the layout live, so the app reshapes
+            self.capp.profile = profiles.get(name)
         self._apply_accent()
         self.save()
         vui.sound.play("click")
@@ -388,6 +392,50 @@ class App:
             right = [ImVec2(cx + r * 0.86, cy - r * 0.5), ImVec2(cx, cy),
                      ImVec2(cx, cy + r), ImVec2(cx + r * 0.86, cy + r * 0.5)]
             dl.add_convex_poly_filled(right, C(theme.with_alpha(theme.current().accent_bright, 0.9)))
+
+    def _status(self):
+        """The status strip the layout places (dense: top bar; tabbed/rail:
+        header). Compact, drawn inline so any layout can host it."""
+        t = theme.current()
+        s = self.server
+        sm = self.sysmon
+        tps = self.agent.last_tps if not self.rp_mode else self.rp.last_tps
+        state = ("trabalhando" if (self.agent.busy or self.rp.busy) else
+                 "carregando" if s.state == "starting" else
+                 "pronto" if s.ready else "desligado")
+        scol = t.ok if s.ready else (t.warn if s.state == "starting" else t.text_mute)
+        used, cap = self.agent.ctx_used, max(1, s.ctx or self.ctx)
+        imgui.text_colored(scol, state)
+        imgui.same_line(0, 16)
+        imgui.text_colored(t.danger if (tps and tps < 10 and sm.vram_tight) else t.text_dim,
+                           f"{tps:.0f} tok/s" if tps else "-- tok/s")
+        if sm.has_gpu:
+            imgui.same_line(0, 16)
+            imgui.text_colored(t.danger if sm.vram_tight else t.text_dim,
+                               f"VRAM {sm.vram_used:.1f}/{sm.vram_total:.0f}G")
+        imgui.same_line(0, 16)
+        imgui.text_colored(t.text_dim, f"ctx {used // 1000}k/{cap // 1000}k")
+        # discreet entrance to the RP side
+        imgui.same_line(0, 16)
+        if imgui.small_button("::"):
+            self.enter_rp()
+        if imgui.is_item_hovered():
+            imgui.set_tooltip("Roleplay")
+
+    def _rp_overlay(self):
+        """RP runs full-screen over the layout (the overlay slot draws last)."""
+        if not self.rp_mode:
+            return
+        io = imgui.get_io()
+        w, h = io.display_size.x, io.display_size.y
+        t = theme.current()
+        imgui.get_window_draw_list().add_rect_filled(ImVec2(0, 0), ImVec2(w, h), C(t.bg))
+        imgui.set_cursor_screen_pos(ImVec2(14, 12))
+        imgui.begin_child("rpoverlay", ImVec2(w - 28, h - 24))
+        try:
+            self._rp_frame(t, 14.0)
+        finally:
+            imgui.end_child()
 
     def _topbar(self, t):
         dl = imgui.get_window_draw_list()
@@ -1547,25 +1595,39 @@ class App:
         self.save()
 
 
+class Shell(compose.Module):
+    """Wires Local Coder's existing views into the compose architecture, so the
+    profile's LAYOUT (tabs / rail / dense / windows) decides the app's shape -
+    a genuinely different UI per theme, not a reskin. The state and all the
+    drawing live on `App`; this just registers them as pages and slots."""
+    name = "coder"
+
+    def __init__(self, state: "App"):
+        self.state = state
+
+    def setup(self, app):
+        self.state.capp = app
+        s = self.state
+        p = lambda fn: (lambda a: fn(theme.current(), 16.0))
+        app.page("agent", "Agente", icon="bolt", draw=p(s._agent_tab), order=0)
+        app.page("audio", "Áudio", icon="play", draw=p(s._audio_tab), order=1)
+        app.page("server", "Servidor", icon="gear", draw=p(s._server_tab), order=2)
+        app.page("settings", "Ajustes", icon="gear", draw=p(s._settings_tab), order=3)
+        app.slot("status", lambda a: s._status())
+        app.slot("overlay", lambda a: s._rp_overlay())
+
+    def frame(self, app):
+        self.state.pump_log()
+
+
 def run():
     st = settings.Settings.load(app="localcoder")
     if not st.extras.get("inited"):
         st.theme_name = "noir-blue"
         st.extras["inited"] = True
-    params = hello_imgui.RunnerParams()
-    params.app_window_params.window_title = "Local Coder"
-    params.app_window_params.window_geometry.size = (1320, 880)
-    params.imgui_window_params.default_imgui_window_type = (
-        hello_imgui.DefaultImGuiWindowType.provide_full_screen_window)
-    params.imgui_window_params.show_menu_bar = False
     app = App(st)
-    params.callbacks.show_gui = app.frame
-    params.callbacks.before_exit = app.shutdown
-    # load the chosen look's fonts/theme at startup, so a characterful look
-    # (ENA's serifs, etc.) is right on the first frame
-    from vertexui import profiles
-    prof = profiles.get(app.look)
-    theme_, faces = (prof.build_theme(), prof.build_faces()) if app.look != "noir" \
-        else (st.build_theme(), st.build_faces())
-    vui.install(params, theme_=theme_, faces=faces)
-    hello_imgui.run(params)
+    capp = compose.App(profile=profiles.get(app.look), title="LOCAL CODER",
+                       app_id="localcoder", size=(1320, 880))
+    capp.use(Shell(app))
+    capp.run()
+    app.shutdown()
